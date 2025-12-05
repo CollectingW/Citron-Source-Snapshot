@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
+// SPDX-FileCopyrightText: Copyright 2025 citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <memory>
@@ -229,10 +231,19 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
         // If the playing buffer has been consumed or has no frames, we need a new one
         if (playing_buffer.consumed || playing_buffer.frames == 0) {
             if (!queue.try_dequeue(playing_buffer)) {
-                // If no buffer was available we've underrun, fill the remaining buffer with
-                // the last written frame and continue.
-                for (size_t i = frames_written; i < num_frames; i++) {
-                    std::memcpy(&output_buffer[i * frame_size], &last_frame[0], frame_size_bytes);
+                // If no buffer was available we've underrun, repeat the last frame to maintain
+                // audio continuity. Use the last valid frame we played to avoid harsh transitions.
+                if (frames_written > 0) {
+                    // We have a valid last_frame, repeat it smoothly
+                    for (size_t i = frames_written; i < num_frames; i++) {
+                        std::memcpy(&output_buffer[i * frame_size], &last_frame[0], frame_size_bytes);
+                    }
+                } else {
+                    // No frames written yet, fill with silence
+                    static constexpr std::array<s16, 6> silence{};
+                    for (size_t i = frames_written; i < num_frames; i++) {
+                        std::memcpy(&output_buffer[i * frame_size], &silence[0], frame_size_bytes);
+                    }
                 }
                 frames_written = num_frames;
                 continue;
