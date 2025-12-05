@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
+// SPDX-FileCopyrightText: Copyright 2025 citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "audio_core/renderer/behavior/behavior_info.h"
@@ -255,22 +256,144 @@ void CommandBuffer::GenerateBiquadFilterCommand(const s32 node_id, EffectInfoBas
                                                 const s16 buffer_offset, const s8 channel,
                                                 const bool needs_init,
                                                 const bool use_float_processing) {
+    const bool is_v2 = behavior && behavior->IsEffectInfoVersion2Supported();
+
+    // Handle ParameterVersion2 (REV15+)
+    if (is_v2) {
+        const auto& param_v2{
+            *reinterpret_cast<BiquadFilterInfo::ParameterVersion2*>(effect_info.GetParameter())};
+
+        // Validate channel bounds
+        if (channel < 0 || channel >= param_v2.channel_count) {
+            return;
+        }
+
+        // Check state field - if state is out of valid range, generate copy command instead
+        if (static_cast<u8>(param_v2.state) > static_cast<u8>(EffectInfoBase::ParameterState::Updated)) {
+            GenerateCopyMixBufferCommand(node_id, effect_info, buffer_offset, channel);
+            return;
+        }
+
+        // Validate raw buffer indices before adding offset (similar to Ryujinx's ArgumentOutOfRange check)
+        const s8 raw_input = param_v2.inputs[channel];
+        const s8 raw_output = param_v2.outputs[channel];
+
+        // Validate raw indices are within reasonable bounds (negative values are allowed for unused channels)
+        // Maximum reasonable buffer index is typically 24-32, use 64 as a safe upper bound
+        constexpr s8 MaxReasonableBufferIndex = 64;
+        if (raw_input < -1 || raw_input >= MaxReasonableBufferIndex) {
+            LOG_WARNING(Service_Audio,
+                        "BiquadFilterCommand: Skipping command generation - raw input index out of range ({})",
+                        raw_input);
+            return;
+        }
+        if (raw_output < -1 || raw_output >= MaxReasonableBufferIndex) {
+            LOG_WARNING(Service_Audio,
+                        "BiquadFilterCommand: Skipping command generation - raw output index out of range ({})",
+                        raw_output);
+            return;
+        }
+
+        const s16 input_index = buffer_offset + raw_input;
+        const s16 output_index = buffer_offset + raw_output;
+
+        // Validate final buffer indices
+        if (input_index < 0) {
+            LOG_WARNING(Service_Audio,
+                        "BiquadFilterCommand: Skipping command generation - invalid input index ({})",
+                        input_index);
+            return;
+        }
+
+        const s16 effective_output = (output_index < 0) ? input_index : output_index;
+        if (output_index < 0) {
+            LOG_WARNING(Service_Audio,
+                        "BiquadFilterCommand: Invalid output index ({}), using input ({}) for in-place "
+                        "processing",
+                        output_index, input_index);
+        }
+
+        auto& cmd{GenerateStart<BiquadFilterCommand, CommandId::BiquadFilter>(node_id)};
+
+        cmd.input = input_index;
+        cmd.output = effective_output;
+
+        // Convert fixed-point coefficients (Q14 format) to float for REV15+ float processing
+        // Q14 means 14 fractional bits, so divide by 2^14 = 16384.0f
+        constexpr f32 q14_scale = 16384.0f;
+        cmd.biquad_float.numerator[0] = static_cast<f32>(param_v2.b[0]) / q14_scale;
+        cmd.biquad_float.numerator[1] = static_cast<f32>(param_v2.b[1]) / q14_scale;
+        cmd.biquad_float.numerator[2] = static_cast<f32>(param_v2.b[2]) / q14_scale;
+        cmd.biquad_float.denominator[0] = static_cast<f32>(param_v2.a[0]) / q14_scale;
+        cmd.biquad_float.denominator[1] = static_cast<f32>(param_v2.a[1]) / q14_scale;
+        cmd.use_float_coefficients = true;
+
+        // Translate state buffer - state pointer is already per-channel, so translate one state only
+        const auto state{reinterpret_cast<VoiceState::BiquadFilterState*>(
+            effect_info.GetStateBuffer() + channel * sizeof(VoiceState::BiquadFilterState))};
+        cmd.state = memory_pool->Translate(CpuAddr(state), sizeof(VoiceState::BiquadFilterState));
+
+        cmd.needs_init = needs_init;
+        cmd.use_float_processing = use_float_processing;
+
+        GenerateEnd<BiquadFilterCommand>(cmd);
+        return;
+    }
+
+    // Handle ParameterVersion1 (legacy)
+    const auto& param_v1{
+        *reinterpret_cast<BiquadFilterInfo::ParameterVersion1*>(effect_info.GetParameter())};
+
+    // Validate raw buffer indices before adding offset (similar to Ryujinx's ArgumentOutOfRange check)
+    const s8 raw_input = param_v1.inputs[channel];
+    const s8 raw_output = param_v1.outputs[channel];
+
+    // Validate raw indices are within reasonable bounds (negative values are allowed for unused channels)
+    // Maximum reasonable buffer index is typically 24-32, use 64 as a safe upper bound
+    constexpr s8 MaxReasonableBufferIndex = 64;
+    if (raw_input < -1 || raw_input >= MaxReasonableBufferIndex) {
+        LOG_WARNING(Service_Audio,
+                    "BiquadFilterCommand: Skipping command generation - raw input index out of range ({})",
+                    raw_input);
+        return;
+    }
+    if (raw_output < -1 || raw_output >= MaxReasonableBufferIndex) {
+        LOG_WARNING(Service_Audio,
+                    "BiquadFilterCommand: Skipping command generation - raw output index out of range ({})",
+                    raw_output);
+        return;
+    }
+
+    const s16 input_index = buffer_offset + raw_input;
+    const s16 output_index = buffer_offset + raw_output;
+
+    // Validate and correct buffer indices
+    if (input_index < 0) {
+        LOG_WARNING(Service_Audio,
+                    "BiquadFilterCommand: Skipping command generation - invalid input index ({})",
+                    input_index);
+        return;
+    }
+
+    const s16 effective_output = (output_index < 0) ? input_index : output_index;
+    if (output_index < 0) {
+        LOG_WARNING(Service_Audio,
+                    "BiquadFilterCommand: Invalid output index ({}), using input ({}) for in-place "
+                    "processing",
+                    output_index, input_index);
+    }
+
     auto& cmd{GenerateStart<BiquadFilterCommand, CommandId::BiquadFilter>(node_id)};
 
-    const auto& parameter{
-        *reinterpret_cast<BiquadFilterInfo::ParameterVersion1*>(effect_info.GetParameter())};
-    const auto state{reinterpret_cast<VoiceState::BiquadFilterState*>(
-        effect_info.GetStateBuffer() + channel * sizeof(VoiceState::BiquadFilterState))};
-
-    cmd.input = buffer_offset + parameter.inputs[channel];
-    cmd.output = buffer_offset + parameter.outputs[channel];
-
-    cmd.biquad.b = parameter.b;
-    cmd.biquad.a = parameter.a;
-
-    // Effects use legacy fixed-point format
+    cmd.input = input_index;
+    cmd.output = effective_output;
+    cmd.biquad.b = param_v1.b;
+    cmd.biquad.a = param_v1.a;
     cmd.use_float_coefficients = false;
 
+    // Translate state buffer address for DSP (v1 uses full buffer size)
+    const auto state{reinterpret_cast<VoiceState::BiquadFilterState*>(
+        effect_info.GetStateBuffer() + channel * sizeof(VoiceState::BiquadFilterState))};
     cmd.state = memory_pool->Translate(CpuAddr(state),
                                        MaxBiquadFilters * sizeof(VoiceState::BiquadFilterState));
 
@@ -593,10 +716,18 @@ void CommandBuffer::GenerateCopyMixBufferCommand(const s32 node_id, EffectInfoBa
                                                  const s16 buffer_offset, const s8 channel) {
     auto& cmd{GenerateStart<CopyMixBufferCommand, CommandId::CopyMixBuffer>(node_id)};
 
-    const auto& parameter{
-        *reinterpret_cast<BiquadFilterInfo::ParameterVersion1*>(effect_info.GetParameter())};
-    cmd.input_index = buffer_offset + parameter.inputs[channel];
-    cmd.output_index = buffer_offset + parameter.outputs[channel];
+    // Extract buffer indices based on parameter version
+    if (behavior && behavior->IsEffectInfoVersion2Supported()) {
+        const auto& param_v2{
+            *reinterpret_cast<BiquadFilterInfo::ParameterVersion2*>(effect_info.GetParameter())};
+        cmd.input_index = buffer_offset + param_v2.inputs[channel];
+        cmd.output_index = buffer_offset + param_v2.outputs[channel];
+    } else {
+        const auto& param_v1{
+            *reinterpret_cast<BiquadFilterInfo::ParameterVersion1*>(effect_info.GetParameter())};
+        cmd.input_index = buffer_offset + param_v1.inputs[channel];
+        cmd.output_index = buffer_offset + param_v1.outputs[channel];
+    }
 
     GenerateEnd<CopyMixBufferCommand>(cmd);
 }
