@@ -200,6 +200,18 @@ std::optional<NetworkInterface> GetSelectedNetworkInterface() {
         return std::nullopt;
     }
 
+    // If "None" is selected or the selected interface doesn't exist, auto-select the first available interface
+    if (selected_network_interface.empty() || selected_network_interface == "None") {
+        static bool auto_selected = false;
+        if (!auto_selected) {
+            LOG_INFO(Network, "Network interface was set to \"None\", auto-selecting first available interface: \"{}\"",
+                     network_interfaces[0].name);
+            Settings::values.network_interface.SetValue(network_interfaces[0].name);
+            auto_selected = true;
+        }
+        return network_interfaces[0];
+    }
+
     const auto res =
         std::ranges::find_if(network_interfaces, [&selected_network_interface](const auto& iface) {
             return iface.name == selected_network_interface;
@@ -209,12 +221,14 @@ std::optional<NetworkInterface> GetSelectedNetworkInterface() {
         // Only print the error once to avoid log spam
         static bool print_error = true;
         if (print_error) {
-            LOG_ERROR(Network, "Couldn't find selected interface \"{}\"",
-                      selected_network_interface);
+            LOG_WARNING(Network, "Couldn't find selected interface \"{}\", falling back to first available: \"{}\"",
+                      selected_network_interface, network_interfaces[0].name);
             print_error = false;
         }
 
-        return std::nullopt;
+        // Auto-select the first available interface as fallback
+        Settings::values.network_interface.SetValue(network_interfaces[0].name);
+        return network_interfaces[0];
     }
 
     return *res;

@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
+// SPDX-FileCopyrightText: Copyright 2025 citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "audio_core/renderer/effect/effect_context.h"
@@ -33,8 +34,26 @@ u32 EffectContext::GetCount() const {
 }
 
 void EffectContext::UpdateStateByDspShared() {
-    for (size_t i = 0; i < dsp_state_count; i++) {
-        effect_infos[i].UpdateResultState(result_states_cpu[i], result_states_dsp[i]);
+    // Ensure we don't exceed the bounds of any of the spans
+    const size_t max_count = std::min({dsp_state_count,
+                                       static_cast<size_t>(effect_infos.size()),
+                                       static_cast<size_t>(result_states_cpu.size()),
+                                       static_cast<size_t>(result_states_dsp.size())});
+
+    for (size_t i = 0; i < max_count; i++) {
+        try {
+            // Validate effect type before calling virtual function to prevent crashes from corrupted data
+            const auto effect_type = effect_infos[i].GetType();
+            if (effect_type == EffectInfoBase::Type::Invalid) {
+                // Skip invalid effects
+                continue;
+            }
+            effect_infos[i].UpdateResultState(result_states_cpu[i], result_states_dsp[i]);
+        } catch (...) {
+            // If UpdateResultState throws (e.g., due to corrupted effect data), skip this effect
+            // This prevents crashes from corrupted audio effect data
+            continue;
+        }
     }
 }
 

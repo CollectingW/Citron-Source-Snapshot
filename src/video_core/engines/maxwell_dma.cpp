@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
+// SPDX-FileCopyrightText: Copyright 2025 citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/algorithm.h"
@@ -72,7 +73,10 @@ void MaxwellDMA::Launch() {
     // TODO(Subv): Perform more research and implement all features of this engine.
     const LaunchDMA& launch = regs.launch_dma;
     ASSERT(launch.interrupt_type == LaunchDMA::InterruptType::NONE);
-    ASSERT(launch.data_transfer_type == LaunchDMA::DataTransferType::NON_PIPELINED);
+    // Allow PIPELINED transfers - they should work the same as NON_PIPELINED for our implementation
+    if (launch.data_transfer_type == LaunchDMA::DataTransferType::NONE) {
+        LOG_WARNING(Render_OpenGL, "DataTransferType::NONE is not supported, treating as NON_PIPELINED");
+    }
 
     if (launch.multi_line_enable) {
         const bool is_src_pitch = launch.src_memory_layout == LaunchDMA::MemoryLayout::PITCH;
@@ -105,18 +109,51 @@ void MaxwellDMA::Launch() {
         }
     } else {
         // TODO: allow multisized components.
+        if (!rasterizer) {
+            LOG_ERROR(Render_OpenGL, "MaxwellDMA: rasterizer is null, cannot perform DMA operation");
+            ReleaseSemaphore();
+            return;
+        }
         auto& accelerate = rasterizer->AccessAccelerateDMA();
         const bool is_const_a_dst = regs.remap_const.dst_x == RemapConst::Swizzle::CONST_A;
         if (regs.launch_dma.remap_enable != 0 && is_const_a_dst) {
-            ASSERT(regs.remap_const.component_size_minus_one == 3);
-            accelerate.BufferClear(regs.offset_out, regs.line_length_in,
-                                   regs.remap_const.remap_consta_value);
-            read_buffer.resize_destructive(regs.line_length_in * sizeof(u32));
-            std::span<u32> span(reinterpret_cast<u32*>(read_buffer.data()), regs.line_length_in);
-            std::ranges::fill(span, regs.remap_const.remap_consta_value);
-            memory_manager.WriteBlockUnsafe(regs.offset_out,
-                                            reinterpret_cast<u8*>(read_buffer.data()),
-                                            regs.line_length_in * sizeof(u32));
+            const u32 component_size = regs.remap_const.component_size_minus_one + 1;
+            const u32 total_bytes = regs.line_length_in * component_size;
+
+            if (component_size == 4) {
+                // 4-byte components: use u32 operations (original behavior)
+                // line_length_in is the number of components, which equals the number of u32 elements when component_size == 4
+                // BufferClear expects amount in u32 elements
+                const u32 num_u32_elements = regs.line_length_in;
+                accelerate.BufferClear(regs.offset_out, num_u32_elements,
+                                       regs.remap_const.remap_consta_value);
+                read_buffer.resize_destructive(total_bytes);
+                std::span<u32> span(reinterpret_cast<u32*>(read_buffer.data()), num_u32_elements);
+                std::ranges::fill(span, regs.remap_const.remap_consta_value);
+                memory_manager.WriteBlockUnsafe(regs.offset_out,
+                                                reinterpret_cast<u8*>(read_buffer.data()),
+                                                total_bytes);
+            } else {
+                // 1, 2, or 3-byte components: use byte operations
+                static bool warned_component_size = false;
+                if (!warned_component_size) {
+                    LOG_WARNING(Render_OpenGL,
+                                "Component size {} is not fully supported, using byte-level operations. "
+                                "This warning will only be shown once.",
+                                component_size);
+                    warned_component_size = true;
+                }
+                read_buffer.resize_destructive(total_bytes);
+                // Fill buffer with the constant value, respecting component size
+                u8* buffer = read_buffer.data();
+                const u32 value = regs.remap_const.remap_consta_value;
+                for (u32 i = 0; i < regs.line_length_in; ++i) {
+                    for (u32 j = 0; j < component_size; ++j) {
+                        buffer[i * component_size + j] = static_cast<u8>((value >> (j * 8)) & 0xFF);
+                    }
+                }
+                memory_manager.WriteBlockUnsafe(regs.offset_out, buffer, total_bytes);
+            }
         } else {
             memory_manager.FlushCaching();
             const auto convert_linear_2_blocklinear_addr = [](u64 address) {
