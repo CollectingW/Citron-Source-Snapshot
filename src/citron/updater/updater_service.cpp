@@ -170,7 +170,6 @@ void UpdaterService::OnDownloadFinished() {
         f.close();
     }
 
-    // Process extraction on a slight delay to ensure file handles are clear
     QTimer::singleShot(100, this, [this, zip_path]() {
         std::filesystem::path extract_path = temp_download_path / "extracted";
 
@@ -202,7 +201,6 @@ void UpdaterService::OnDownloadFinished() {
 
     std::filesystem::path original_path = appimage_env;
 
-    // Backup logic
     if (UISettings::values.updater_enable_backups.GetValue()) {
         std::filesystem::path backup_dir = UISettings::values.updater_backup_path.GetValue().empty() ?
             (original_path.parent_path() / "backup") : std::filesystem::path(UISettings::values.updater_backup_path.GetValue());
@@ -219,7 +217,6 @@ void UpdaterService::OnDownloadFinished() {
         n_file.write(data);
         n_file.close();
 
-        // chmod +x
         n_file.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner|QFileDevice::ExeOwner|
                               QFileDevice::ReadGroup|QFileDevice::ExeGroup|
                               QFileDevice::ReadOther|QFileDevice::ExeOther);
@@ -238,6 +235,13 @@ void UpdaterService::OnDownloadFinished() {
 #endif
 }
 
+void UpdaterService::OnDownloadError(QNetworkReply::NetworkError error) {
+    if (current_reply) {
+        emit UpdateError(current_reply->errorString());
+    }
+    update_in_progress.store(false);
+}
+
 void UpdaterService::ParseUpdateResponse(const QByteArray& response, const QString& channel) {
     QJsonDocument doc = QJsonDocument::fromJson(response);
     if (!doc.isArray()) return;
@@ -251,7 +255,6 @@ void UpdaterService::ParseUpdateResponse(const QByteArray& response, const QStri
         if (channel.toLower() == QStringLiteral("stable")) {
             latest_v = rel_obj.value(QStringLiteral("tag_name")).toString().toStdString();
         } else {
-            // Nightly names are usually "Nightly Build - [hash]"
             latest_v = ExtractCommitHash(rel_obj.value(QStringLiteral("name")).toString().toStdString());
         }
 
@@ -277,13 +280,11 @@ void UpdaterService::ParseUpdateResponse(const QByteArray& response, const QStri
             if (!name.endsWith(QStringLiteral(".AppImage"), Qt::CaseInsensitive)) continue;
             os_valid.push_back(opt);
 
-            // Architecture matching
             if (current_variant.find("aarch64") != std::string::npos && name.contains(QStringLiteral("aarch64"), Qt::CaseInsensitive)) {
                 variant_matched.push_back(opt);
             } else if (current_variant.find("v3") != std::string::npos && name.contains(QStringLiteral("v3"), Qt::CaseInsensitive)) {
                 variant_matched.push_back(opt);
             } else if (!name.contains(QStringLiteral("v3"), Qt::CaseInsensitive) && !name.contains(QStringLiteral("aarch64"), Qt::CaseInsensitive)) {
-                // Fallback for generic x86_64
                 if (current_variant.find("x86_64") != std::string::npos && current_variant.find("v3") == std::string::npos) {
                     variant_matched.push_back(opt);
                 }
@@ -292,7 +293,6 @@ void UpdaterService::ParseUpdateResponse(const QByteArray& response, const QStri
             if (!name.endsWith(QStringLiteral(".zip"), Qt::CaseInsensitive) || name.contains(QStringLiteral("PGO"), Qt::CaseInsensitive)) continue;
             os_valid.push_back(opt);
 
-            // Windows Variant Matching (v3 vs generic)
             if (current_variant.find("v3") != std::string::npos && name.contains(QStringLiteral("v3"), Qt::CaseInsensitive)) {
                 variant_matched.push_back(opt);
             } else if (current_variant.find("v3") == std::string::npos && !name.contains(QStringLiteral("v3"), Qt::CaseInsensitive)) {
@@ -301,7 +301,6 @@ void UpdaterService::ParseUpdateResponse(const QByteArray& response, const QStri
 #endif
         }
 
-        // Priority: Match Variant -> Any OS Valid -> Fail
         info.download_options = variant_matched.empty() ? os_valid : variant_matched;
 
         if (!info.download_options.empty()) {
@@ -313,6 +312,44 @@ void UpdaterService::ParseUpdateResponse(const QByteArray& response, const QStri
             return;
         }
     }
+}
+
+bool UpdaterService::HasStagedUpdate(const std::filesystem::path& p) {
+#ifdef _WIN32
+    return std::filesystem::exists(p / "update_staging") && std::filesystem::exists(p / "update_staging" / "apply_update.bat");
+#else
+    return false;
+#endif
+}
+
+bool UpdaterService::ApplyStagedUpdate(const std::filesystem::path& p) {
+#ifdef _WIN32
+    try {
+        std::filesystem::path s = p / "update_staging";
+        if (!std::filesystem::exists(s)) return false;
+
+        std::filesystem::path b = p / "backup_before_update";
+        std::filesystem::create_directories(b);
+
+        for (const auto& e : std::filesystem::recursive_directory_iterator(s)) {
+            if (e.is_regular_file()) {
+                std::filesystem::path rel = std::filesystem::relative(e.path(), s);
+                std::filesystem::path dest = p / rel;
+                if (std::filesystem::exists(dest)) {
+                    std::filesystem::create_directories((b / rel).parent_path());
+                    std::filesystem::copy_file(dest, b / rel, std::filesystem::copy_options::overwrite_existing);
+                }
+                std::filesystem::create_directories(dest.parent_path());
+                std::filesystem::copy_file(e.path(), dest, std::filesystem::copy_options::overwrite_existing);
+            }
+        }
+        std::error_code ec;
+        std::filesystem::remove_all(s, ec);
+        return true;
+    } catch (...) { return false; }
+#else
+    return false;
+#endif
 }
 
 #ifdef _WIN32
@@ -345,7 +382,6 @@ bool UpdaterService::ExtractArchive(const std::filesystem::path& a_p, const std:
     archive_write_free(ext);
     return true;
 #else
-    // Windows PowerShell Fallback if LibArchive is missing
     QString cmd = QString("powershell -Command \"Expand-Archive -Path '%1' -DestinationPath '%2' -Force\"")
                   .arg(QString::fromStdString(a_p.string()))
                   .arg(QString::fromStdString(e_p.string()));
@@ -358,7 +394,6 @@ bool UpdaterService::InstallUpdate(const std::filesystem::path& u_p) {
         std::filesystem::path staging = app_directory / "update_staging";
         std::filesystem::create_directories(staging);
 
-        // Clean staging area first
         std::error_code ec;
         std::filesystem::remove_all(staging, ec);
         std::filesystem::create_directories(staging);
@@ -499,8 +534,6 @@ bool UpdaterService::CreateUpdateHelperScript(const std::filesystem::path& stagi
 bool UpdaterService::LaunchUpdateHelper() {
     std::filesystem::path sc = app_directory / "update_staging" / "apply_update.bat";
     if (!std::filesystem::exists(sc)) return false;
-
-    // We launch via cmd /c and detach so the script survives Citron's death
     return QProcess::startDetached("cmd.exe", QStringList() << "/C" << QString::fromStdString(sc.string()));
 }
 #endif
