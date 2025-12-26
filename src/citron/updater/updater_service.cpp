@@ -111,18 +111,22 @@ void UpdaterService::DownloadAndInstallUpdate(const std::string& download_url) {
     update_in_progress.store(true);
     cancel_requested.store(false);
 
-#ifdef _WIN32
+    #ifdef _WIN32
     if (!CreateBackup()) {
         emit UpdateCompleted(UpdateResult::PermissionError, QStringLiteral("Failed to create backup of citron.exe"));
         update_in_progress.store(false);
         return;
     }
-#endif
+    #endif
 
     QNetworkRequest request{QUrl(QString::fromStdString(download_url))};
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+    request.setRawHeader("User-Agent", QByteArrayLiteral("Citron-Updater/1.0"));
 
     current_reply = network_manager->get(request);
+
+    // CRITICAL: Connect the error signal so we don't hang on network failure
+    connect(current_reply, &QNetworkReply::errorOccurred, this, &UpdaterService::OnDownloadError);
     connect(current_reply, &QNetworkReply::downloadProgress, this, &UpdaterService::OnDownloadProgress);
     connect(current_reply, &QNetworkReply::finished, this, &UpdaterService::OnDownloadFinished);
 }
@@ -543,7 +547,9 @@ bool UpdaterService::LaunchUpdateHelper() {
 #endif
 
 void UpdaterService::OnDownloadProgress(qint64 r, qint64 t) {
-    if (t > 0) emit UpdateDownloadProgress(static_cast<int>((r * 100) / t), r, t);
+    // We emit even if t is <= 0 so the CLI can at least show bytes received
+    int percentage = (t > 0) ? static_cast<int>((r * 100) / t) : 0;
+    emit UpdateDownloadProgress(percentage, r, t);
 }
 
 bool UpdaterService::EnsureDirectoryExists(const std::filesystem::path& p) const {
