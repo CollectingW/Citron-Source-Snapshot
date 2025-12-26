@@ -5354,30 +5354,25 @@ void GMainWindow::MigrateConfigFiles() {
 
 void GMainWindow::UpdateWindowTitle(std::string_view title_name, std::string_view title_version,
                                     std::string_view gpu_vendor) {
-    // Build the base title from the CMake-generated variables.
-    std::string base_title = "citron ";
-    base_title += Common::g_build_fullname; // This is "Nightly " or "" for Stable
-    base_title += "| ";
-    base_title += Common::g_build_version;  // This is the git hash or Stable version tag.
 
-    // Add the PGO tag if enabled.
+    std::string base_title = "citron ";
+    base_title += Common::g_build_fullname;
+    base_title += "| ";
+    base_title += Common::g_build_version;
+
     #ifdef CITRON_ENABLE_PGO_USE
-        base_title += " | PGO";
+    base_title += " | PGO";
     #endif
 
     if (title_name.empty()) {
         setWindowTitle(QString::fromStdString(base_title));
     } else {
-        const auto run_title = [&]() {
-            if (title_version.empty()) {
-                return fmt::format("{} | {} | {}", base_title, title_name, gpu_vendor);
-            }
-            return fmt::format("{} | {} | {} | {}", base_title, title_name, title_version,
-                               gpu_vendor);
-        }();
+        const auto run_title = title_version.empty()
+        ? fmt::format("{} | {} | {}", base_title, title_name, gpu_vendor)
+        : fmt::format("{} | {} | {} | {}", base_title, title_name, title_version, gpu_vendor);
         setWindowTitle(QString::fromStdString(run_title));
     }
-}
+                                    }
 
 std::string GMainWindow::CreateTASFramesString(
     std::array<size_t, InputCommon::TasInput::PLAYER_NUMBER> frames) const {
@@ -6077,7 +6072,122 @@ static void SetHighDPIAttributes() {
 #endif
 }
 
+#ifndef CITRON_VARIANT_BAKED
+#define CITRON_VARIANT_BAKED "Generic"
+#endif
+#ifndef CITRON_VERSION_BAKED
+#define CITRON_VERSION_BAKED "0.11.0"
+#endif
+#ifndef CITRON_HASH_BAKED
+#define CITRON_HASH_BAKED "Unknown"
+#endif
+
 int main(int argc, char* argv[]) {
+    // 1. Programmatic Version Output
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-v" || arg == "--version") {
+            // Displays: citron Nightly | Linux x86_64 v3 | 0.11.0 (ab4d2a7f3)
+            fmt::print("citron {}| {} ({})\n", Common::g_build_fullname, Common::g_citron_version, Common::g_citron_hash);
+            return 0;
+        }
+    }
+
+    // 2. Headless Update Flag
+for (int i = 1; i < argc; ++i) {
+    if (std::string(argv[i]) == "--update") {
+        QString forced_channel;
+        if (i + 1 < argc) {
+            std::string next_arg = argv[i+1];
+            if (next_arg == "stable" || next_arg == "nightly") {
+                forced_channel = QString::fromStdString(next_arg);
+            }
+        }
+
+        // Use QCoreApplication for CLI to avoid initializing heavy GUI/Vulkan/etc.
+        QCoreApplication app(argc, argv);
+
+        // Use a unique_ptr or parent it to 'app' to ensure cleanup
+        auto* service = new Updater::UpdaterService(&app);
+
+        fmt::print("Checking for {} updates...\n", forced_channel.isEmpty() ? "latest" : forced_channel.toStdString());
+
+        QObject::connect(service, &Updater::UpdaterService::UpdateCheckCompleted, [&](bool has_update, const Updater::UpdateInfo& info) {
+            if (!has_update) {
+                fmt::print("You are already on the latest version ({})\n", service->GetCurrentVersion(forced_channel));
+                app.quit();
+            } else {
+                int selected_index = 0;
+                // If the new variant logic found exactly one match, this menu is skipped.
+                // If it found multiple (fallback), it asks the user.
+                if (info.download_options.size() > 1) {
+                    fmt::print("\nNew version found: {}\n", info.version);
+                    fmt::print("Multiple variants found. Please select one:\n");
+                    for (size_t k = 0; k < info.download_options.size(); ++k) {
+                        fmt::print(" [{}] {}\n", k, info.download_options[k].name);
+                    }
+                    fmt::print("Select variant index (default 0): ");
+
+                    std::string input;
+                    std::getline(std::cin, input);
+                    try {
+                        if (!input.empty()) selected_index = std::stoi(input);
+                    } catch (...) { selected_index = 0; }
+
+                    if (selected_index < 0 || selected_index >= static_cast<int>(info.download_options.size())) {
+                        fmt::print("Invalid selection. Aborting.\n");
+                        app.exit(1);
+                        return;
+                    }
+                }
+
+                fmt::print("Downloading: {}\n", info.download_options[selected_index].name);
+                service->DownloadAndInstallUpdate(info.download_options[selected_index].url);
+            }
+        });
+
+        QObject::connect(service, &Updater::UpdaterService::UpdateDownloadProgress, [](int percentage, qint64 received, qint64 total) {
+            fmt::print("\rDownloading: [");
+            int pos = percentage / 5;
+            for (int j = 0; j < 20; ++j) {
+                if (j < pos) fmt::print("="); else if (j == pos) fmt::print(">"); else fmt::print(" ");
+            }
+            fmt::print("] {}% ({}/{})", percentage, received, total); // Added byte counts for clarity
+            fflush(stdout);
+        });
+
+        QObject::connect(service, &Updater::UpdaterService::UpdateCompleted, [&](Updater::UpdaterService::UpdateResult result, const QString& message) {
+            if (result == Updater::UpdaterService::UpdateResult::Success) {
+                fmt::print("\nUpdate downloaded and staged successfully.\n");
+
+#ifdef _WIN32
+                fmt::print("Launching update helper and restarting Citron...\n");
+                if (service->LaunchUpdateHelper()) {
+                    app.quit();
+                } else {
+                    fmt::print("Error: Could not launch update helper. Please run 'update_staging/apply_update.bat' manually.\n");
+                    app.exit(1);
+                }
+#else
+                fmt::print("Please restart Citron to apply the update.\n");
+                app.quit();
+#endif
+            } else {
+                fmt::print("\nUpdate failed: {}\n", message.toStdString());
+                app.exit(1);
+            }
+        });
+
+        QObject::connect(service, &Updater::UpdaterService::UpdateError, [&](const QString& err) {
+            fmt::print("\nError during update: {}\n", err.toStdString());
+            app.exit(1);
+        });
+
+        service->CheckForUpdates(forced_channel);
+        return app.exec();
+    }
+}
+
     // Set environment variables for AppImage compatibility
     // This must be done before the QApplication is created.
     const bool is_appimage = !qgetenv("APPIMAGE").isEmpty();
@@ -6237,50 +6347,45 @@ void GMainWindow::OnCheckForUpdates() {
 
 void GMainWindow::CheckForUpdatesAutomatically() {
     #ifdef CITRON_USE_AUTO_UPDATER
-    // Check if automatic updates are enabled in general settings
     if (!Settings::values.enable_auto_update_check.GetValue()) {
         return;
     }
 
     LOG_INFO(Frontend, "Checking for updates automatically...");
-
     auto* updater_service = new Updater::UpdaterService(this);
 
     connect(updater_service, &Updater::UpdaterService::UpdateCheckCompleted, this,
             [this, updater_service](bool has_update, const Updater::UpdateInfo& update_info) {
                 if (has_update) {
-                    // Create an advanced message box
                     QMessageBox msg_box(this);
                     msg_box.setWindowTitle(tr("Update Available"));
                     msg_box.setText(tr("A new version of Citron is available: %1")
                                       .arg(QString::fromStdString(update_info.version)));
-                    msg_box.setInformativeText(tr("Click Help → Check for Updates to download it. You can also choose whether you get notified of Stable or Nightly releases. Head over to Emulation -> Configure & go to the UI Tab and choose your selection within the Update Channel."));
-                    msg_box.setIcon(QMessageBox::Information);
-                    msg_box.setStandardButtons(QMessageBox::Ok);
+                    msg_box.setInformativeText(tr("Would you like to install the update now?"));
+                    msg_box.setIcon(QMessageBox::Question);
 
-                    // Create and add the checkbox
-                    QCheckBox* check_box = new QCheckBox(tr("Don't check for updates on startup"));
-                    msg_box.setCheckBox(check_box);
+                    QPushButton* update_now = msg_box.addButton(tr("Update Now"), QMessageBox::AcceptRole);
+                    msg_box.addButton(tr("Later"), QMessageBox::RejectRole);
+
+                    QCheckBox* dont_show = new QCheckBox(tr("Don't check on startup"));
+                    msg_box.setCheckBox(dont_show);
 
                     msg_box.exec();
 
-                    // After the dialog closes, check if the box was ticked
-                    if (msg_box.checkBox()->isChecked()) {
+                    if (msg_box.clickedButton() == update_now) {
+                        auto* dialog = new Updater::UpdaterDialog(this);
+                        dialog->setAttribute(Qt::WA_DeleteOnClose);
+                        dialog->show();
+                        dialog->OnUpdateCheckCompleted(true, update_info);
+                        dialog->StartUpdateImmediate();
+                    }
+
+                    if (dont_show->isChecked()) {
                         UISettings::values.check_for_updates_on_start = false;
-                        // Save the setting immediately
                         this->config->SaveAllValues();
                     }
                 }
                 updater_service->deleteLater();
-            });
-
-    connect(updater_service, &Updater::UpdaterService::UpdateCompleted, this,
-            [updater_service](Updater::UpdaterService::UpdateResult result, const QString& message) {
-                if (result == Updater::UpdaterService::UpdateResult::NetworkError ||
-                    result == Updater::UpdaterService::UpdateResult::Failed) {
-                    LOG_WARNING(Frontend, "Automatic update check failed: {}", message.toStdString());
-                    }
-                    updater_service->deleteLater();
             });
 
     updater_service->CheckForUpdates();
