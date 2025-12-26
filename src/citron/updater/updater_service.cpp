@@ -325,26 +325,26 @@ bool UpdaterService::HasStagedUpdate(const std::filesystem::path& p) {
 bool UpdaterService::ApplyStagedUpdate(const std::filesystem::path& p) {
 #ifdef _WIN32
     try {
-        std::filesystem::path s = p / "update_staging";
+        std::filesystem::path s = p / "update_staging"; 
         if (!std::filesystem::exists(s)) return false;
-
-        std::filesystem::path b = p / "backup_before_update";
+        
+        std::filesystem::path b = p / "backup_before_update"; 
         std::filesystem::create_directories(b);
-
+        
         for (const auto& e : std::filesystem::recursive_directory_iterator(s)) {
             if (e.is_regular_file()) {
                 std::filesystem::path rel = std::filesystem::relative(e.path(), s);
                 std::filesystem::path dest = p / rel;
-                if (std::filesystem::exists(dest)) {
-                    std::filesystem::create_directories((b / rel).parent_path());
-                    std::filesystem::copy_file(dest, b / rel, std::filesystem::copy_options::overwrite_existing);
+                if (std::filesystem::exists(dest)) { 
+                    std::filesystem::create_directories((b / rel).parent_path()); 
+                    std::filesystem::copy_file(dest, b / rel, std::filesystem::copy_options::overwrite_existing); 
                 }
-                std::filesystem::create_directories(dest.parent_path());
+                std::filesystem::create_directories(dest.parent_path()); 
                 std::filesystem::copy_file(e.path(), dest, std::filesystem::copy_options::overwrite_existing);
             }
         }
-        std::error_code ec;
-        std::filesystem::remove_all(s, ec);
+        std::error_code ec; 
+        std::filesystem::remove_all(s, ec); 
         return true;
     } catch (...) { return false; }
 #else
@@ -382,7 +382,7 @@ bool UpdaterService::ExtractArchive(const std::filesystem::path& a_p, const std:
     archive_write_free(ext);
     return true;
 #else
-    QString cmd = QString("powershell -Command \"Expand-Archive -Path '%1' -DestinationPath '%2' -Force\"")
+    QString cmd = QStringLiteral("powershell -Command \"Expand-Archive -Path '%1' -DestinationPath '%2' -Force\"")
                   .arg(QString::fromStdString(a_p.string()))
                   .arg(QString::fromStdString(e_p.string()));
     return QProcess::execute(cmd) == 0;
@@ -534,7 +534,7 @@ bool UpdaterService::CreateUpdateHelperScript(const std::filesystem::path& stagi
 bool UpdaterService::LaunchUpdateHelper() {
     std::filesystem::path sc = app_directory / "update_staging" / "apply_update.bat";
     if (!std::filesystem::exists(sc)) return false;
-    return QProcess::startDetached("cmd.exe", QStringList() << "/C" << QString::fromStdString(sc.string()));
+    return QProcess::startDetached(QStringLiteral("cmd.exe"), QStringList() << QStringLiteral("/C") << QString::fromStdString(sc.string()));
 }
 #endif
 
