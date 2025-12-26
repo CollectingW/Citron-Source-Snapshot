@@ -194,24 +194,27 @@ void UpdaterService::OnDownloadFinished() {
 #elif defined(__linux__)
     const char* appimage_env = qgetenv("APPIMAGE").constData();
     if (!appimage_env || strlen(appimage_env) == 0) {
-        emit UpdateError(QStringLiteral("Not running from an AppImage. Manual update required."));
+        emit UpdateError(QStringLiteral("Not running from an AppImage. Check your PATH."));
         update_in_progress.store(false);
         return;
     }
 
     std::filesystem::path original_path = appimage_env;
+    std::filesystem::path new_path = original_path.string() + ".new";
 
+    // 1. BACKUP LOGIC
     if (UISettings::values.updater_enable_backups.GetValue()) {
         std::filesystem::path backup_dir = UISettings::values.updater_backup_path.GetValue().empty() ?
             (original_path.parent_path() / "backup") : std::filesystem::path(UISettings::values.updater_backup_path.GetValue());
 
         std::error_code ec;
         std::filesystem::create_directories(backup_dir, ec);
-        std::filesystem::copy_file(original_path, backup_dir / ("citron-backup-" + GetCurrentVersion() + ".AppImage"),
-                                   std::filesystem::copy_options::overwrite_existing, ec);
+        std::filesystem::path b_file = backup_dir / ("citron-backup-" + GetCurrentVersion() + ".AppImage");
+        std::filesystem::copy_file(original_path, b_file, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) LOG_ERROR(Frontend, "Backup failed: {}", ec.message());
     }
 
-    std::filesystem::path new_path = original_path.string() + ".new";
+    // 2. SAVE NEW DATA
     QFile n_file(QString::fromStdString(new_path.string()));
     if (n_file.open(QIODevice::WriteOnly)) {
         n_file.write(data);
@@ -222,15 +225,16 @@ void UpdaterService::OnDownloadFinished() {
                               QFileDevice::ReadOther|QFileDevice::ExeOther);
 
         std::error_code ec;
+        // TRY RENAME: If this fails because the file is busy, we will fall back to staging.
         std::filesystem::rename(new_path, original_path, ec);
         if (ec) {
-             emit UpdateError(QString::fromStdString("Failed to replace AppImage: " + ec.message()));
-             update_in_progress.store(false);
-             return;
+             LOG_WARNING(Frontend, "Direct replace failed (file busy). Staging update for next launch.");
+             // We leave .new there and let the next launch handle it, or prompt user.
+             emit UpdateCompleted(UpdateResult::Success, QStringLiteral("Update downloaded. Please delete the old AppImage and rename the .new file."));
+        } else {
+             emit UpdateCompleted(UpdateResult::Success, QStringLiteral("Success"));
         }
     }
-
-    emit UpdateCompleted(UpdateResult::Success, QStringLiteral("Success"));
     update_in_progress.store(false);
 #endif
 }
@@ -325,26 +329,26 @@ bool UpdaterService::HasStagedUpdate(const std::filesystem::path& p) {
 bool UpdaterService::ApplyStagedUpdate(const std::filesystem::path& p) {
 #ifdef _WIN32
     try {
-        std::filesystem::path s = p / "update_staging"; 
+        std::filesystem::path s = p / "update_staging";
         if (!std::filesystem::exists(s)) return false;
-        
-        std::filesystem::path b = p / "backup_before_update"; 
+
+        std::filesystem::path b = p / "backup_before_update";
         std::filesystem::create_directories(b);
-        
+
         for (const auto& e : std::filesystem::recursive_directory_iterator(s)) {
             if (e.is_regular_file()) {
                 std::filesystem::path rel = std::filesystem::relative(e.path(), s);
                 std::filesystem::path dest = p / rel;
-                if (std::filesystem::exists(dest)) { 
-                    std::filesystem::create_directories((b / rel).parent_path()); 
-                    std::filesystem::copy_file(dest, b / rel, std::filesystem::copy_options::overwrite_existing); 
+                if (std::filesystem::exists(dest)) {
+                    std::filesystem::create_directories((b / rel).parent_path());
+                    std::filesystem::copy_file(dest, b / rel, std::filesystem::copy_options::overwrite_existing);
                 }
-                std::filesystem::create_directories(dest.parent_path()); 
+                std::filesystem::create_directories(dest.parent_path());
                 std::filesystem::copy_file(e.path(), dest, std::filesystem::copy_options::overwrite_existing);
             }
         }
-        std::error_code ec; 
-        std::filesystem::remove_all(s, ec); 
+        std::error_code ec;
+        std::filesystem::remove_all(s, ec);
         return true;
     } catch (...) { return false; }
 #else
