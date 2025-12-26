@@ -318,7 +318,7 @@ static QString PrettyProductName() {
 }
 
 #ifdef _WIN32
-static void OverrideWindowsFont() {
+void OverrideWindowsFont() {
     // Qt5 chooses these fonts on Windows and they have fairly ugly alphanumeric/cyrillic characters
     // Asking to use "MS Shell Dlg 2" gives better other chars while leaving the Chinese Characters.
     const QString startup_font = QApplication::font().family();
@@ -6128,7 +6128,7 @@ int main(int argc, char* argv[]) {
 
         // Advanced SSL Search for Linux (Fixes hangs on Nobara/Fedora/OpenSUSE)
         const std::vector<std::string> potential_certs = {
-            "/etc/pki/tls/certs/ca-bundle.crt",       // Fedora/Nobara/RHEL (CRITICAL)
+            "/etc/pki/tls/certs/ca-bundle.crt",       // Fedora/Nobara/RHEL
             "/etc/ssl/certs/ca-certificates.crt",     // Debian/Ubuntu/Arch
             "/etc/ssl/ca-bundle.pem",                 // OpenSUSE
             "/var/lib/ca-certificates/ca-bundle.pem", // Alternative OpenSUSE
@@ -6187,13 +6187,12 @@ int main(int argc, char* argv[]) {
         QCoreApplication app(argc, argv);
         auto* service = new Updater::UpdaterService(&app);
 
-        // SSL Check
         if (!QSslSocket::supportsSsl()) {
             fmt::print("CRITICAL ERROR: SSL/TLS is not supported in this build!\n");
             return 1;
         }
 
-        if (force_update) fmt::print("Force update enabled.\n");
+        if (force_update) fmt::print("Force update initialized. Ignoring version check...\n");
         fmt::print("Checking for {} updates...\n", forced_channel.isEmpty() ? "latest" : forced_channel.toStdString());
 
         QObject::connect(service, &Updater::UpdaterService::UpdateCheckCompleted, [&](bool has_update, const Updater::UpdateInfo& info) {
@@ -6203,7 +6202,7 @@ int main(int argc, char* argv[]) {
             } else {
                 int selected_index = 0;
                 if (info.download_options.size() > 1) {
-                    fmt::print("\nUpdate Found: {}\n", info.version);
+                    fmt::print("\nUpdate Info: {}\n", info.version);
                     fmt::print("Multiple variants found. Please select one:\n");
                     for (size_t k = 0; k < info.download_options.size(); ++k) {
                         fmt::print(" [{}] {}\n", k, info.download_options[k].name);
@@ -6217,7 +6216,7 @@ int main(int argc, char* argv[]) {
                 }
 
                 if (selected_index < 0 || selected_index >= static_cast<int>(info.download_options.size())) {
-                    fmt::print("Invalid selection.\n");
+                    fmt::print("Invalid selection. Aborting.\n");
                     app.exit(1);
                     return;
                 }
@@ -6225,8 +6224,7 @@ int main(int argc, char* argv[]) {
                 fmt::print("Downloading: {}\n", info.download_options[selected_index].name);
                 std::fflush(stdout);
 
-                // --- THE FIX FOR HANGING DOWNLOADS ---
-                // url must be std::string to match DownloadAndInstallUpdate signature
+                // Fixed: Ensure url is std::string to match UpdaterService signature
                 const std::string url = info.download_options[selected_index].url;
                 QTimer::singleShot(100, [service, url]() {
                     service->DownloadAndInstallUpdate(url);
@@ -6338,6 +6336,17 @@ int main(int argc, char* argv[]) {
         }
     }
 #endif
+#endif
+
+#ifdef _WIN32
+    OverrideWindowsFont();
+#endif
+
+#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
+    const QLocale locale = QLocale::system();
+    if (QStringLiteral("\u3008") == locale.toString(1)) {
+        QLocale::setDefault(QLocale::system().name());
+    }
 #endif
 
     setlocale(LC_ALL, "C");
