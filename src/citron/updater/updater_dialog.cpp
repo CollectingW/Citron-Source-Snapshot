@@ -103,6 +103,10 @@ void UpdaterDialog::CheckForUpdates() {
     updater_service->CheckForUpdates();
 }
 
+void UpdaterDialog::StartUpdateImmediate() {
+    OnDownloadButtonClicked();
+}
+
 void UpdaterDialog::OnUpdateCheckCompleted(bool has_update, const Updater::UpdateInfo& update_info) {
     if (has_update) {
         current_update_info = update_info;
@@ -466,5 +470,3 @@ QString UpdaterDialog::GetUpdateMessage(Updater::UpdaterService::UpdateResult re
 }
 
 } // namespace Updater
-
-#include "updater_dialog.moc"
