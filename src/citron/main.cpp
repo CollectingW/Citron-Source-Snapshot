@@ -6081,112 +6081,160 @@ static void SetHighDPIAttributes() {
 #ifndef CITRON_HASH_BAKED
 #define CITRON_HASH_BAKED "Unknown"
 #endif
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#include <fcntl.h>
+#include <stdio.h>
+#endif
 
 int main(int argc, char* argv[]) {
+#ifdef _WIN32
+    // We check if the user is trying to use CLI commands.
+    bool has_cli_arg = false;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-v" || arg == "--version" || arg == "--update" || arg == "--help") {
+            has_cli_arg = true;
+            break;
+        }
+    }
+
+    // If we are using CLI commands, attach to the terminal so we can see fmt::print output
+    if (has_cli_arg) {
+        if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+            // Redirect standard output/error to the terminal window
+            auto redirect = [](DWORD std_handle, FILE* stream, const char* mode) {
+                HANDLE h = GetStdHandle(std_handle);
+                if (h != INVALID_HANDLE_VALUE) {
+                    int fd = _open_osfhandle((intptr_t)h, _O_TEXT);
+                    if (fd != -1) {
+                        FILE* fp = _fdopen(fd, mode);
+                        if (fp) {
+                            *stream = *fp;
+                            setvbuf(stream, NULL, _IONBF, 0);
+                        }
+                    }
+                }
+            };
+            redirect(STD_OUTPUT_HANDLE, stdout, "w");
+            redirect(STD_ERROR_HANDLE, stderr, "w");
+            redirect(STD_INPUT_HANDLE, stdin, "r");
+            std::ios::sync_with_stdio();
+        }
+    }
+
+#endif
+
     // 1. Programmatic Version Output
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-v" || arg == "--version") {
-            // Displays: citron Nightly | Linux x86_64 v3 | 0.11.0 (ab4d2a7f3)
+            // This will now correctly appear in CMD/PowerShell
             fmt::print("citron {}| {} ({})\n", Common::g_build_fullname, Common::g_citron_version, Common::g_citron_hash);
             return 0;
         }
     }
 
     // 2. Headless Update Flag
-for (int i = 1; i < argc; ++i) {
-    if (std::string(argv[i]) == "--update") {
-        QString forced_channel;
-        if (i + 1 < argc) {
-            std::string next_arg = argv[i+1];
-            if (next_arg == "stable" || next_arg == "nightly") {
-                forced_channel = QString::fromStdString(next_arg);
-            }
-        }
-
-        // Use QCoreApplication for CLI to avoid initializing heavy GUI/Vulkan/etc.
-        QCoreApplication app(argc, argv);
-
-        // Use a unique_ptr or parent it to 'app' to ensure cleanup
-        auto* service = new Updater::UpdaterService(&app);
-
-        fmt::print("Checking for {} updates...\n", forced_channel.isEmpty() ? "latest" : forced_channel.toStdString());
-
-        QObject::connect(service, &Updater::UpdaterService::UpdateCheckCompleted, [&](bool has_update, const Updater::UpdateInfo& info) {
-            if (!has_update) {
-                fmt::print("You are already on the latest version ({})\n", service->GetCurrentVersion(forced_channel));
-                app.quit();
-            } else {
-                int selected_index = 0;
-                // If the new variant logic found exactly one match, this menu is skipped.
-                // If it found multiple (fallback), it asks the user.
-                if (info.download_options.size() > 1) {
-                    fmt::print("\nNew version found: {}\n", info.version);
-                    fmt::print("Multiple variants found. Please select one:\n");
-                    for (size_t k = 0; k < info.download_options.size(); ++k) {
-                        fmt::print(" [{}] {}\n", k, info.download_options[k].name);
-                    }
-                    fmt::print("Select variant index (default 0): ");
-
-                    std::string input;
-                    std::getline(std::cin, input);
-                    try {
-                        if (!input.empty()) selected_index = std::stoi(input);
-                    } catch (...) { selected_index = 0; }
-
-                    if (selected_index < 0 || selected_index >= static_cast<int>(info.download_options.size())) {
-                        fmt::print("Invalid selection. Aborting.\n");
-                        app.exit(1);
-                        return;
-                    }
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--update") {
+            QString forced_channel;
+            if (i + 1 < argc) {
+                std::string next_arg = argv[i + 1];
+                if (next_arg == "stable" || next_arg == "nightly") {
+                    forced_channel = QString::fromStdString(next_arg);
                 }
-
-                fmt::print("Downloading: {}\n", info.download_options[selected_index].name);
-                service->DownloadAndInstallUpdate(info.download_options[selected_index].url);
             }
-        });
 
-        QObject::connect(service, &Updater::UpdaterService::UpdateDownloadProgress, [](int percentage, qint64 received, qint64 total) {
-            fmt::print("\rDownloading: [");
-            int pos = percentage / 5;
-            for (int j = 0; j < 20; ++j) {
-                if (j < pos) fmt::print("="); else if (j == pos) fmt::print(">"); else fmt::print(" ");
-            }
-            fmt::print("] {}% ({}/{})", percentage, received, total); // Added byte counts for clarity
-            fflush(stdout);
-        });
+            QCoreApplication app(argc, argv);
+            auto* service = new Updater::UpdaterService(&app);
 
-        QObject::connect(service, &Updater::UpdaterService::UpdateCompleted, [&](Updater::UpdaterService::UpdateResult result, const QString& message) {
-            if (result == Updater::UpdaterService::UpdateResult::Success) {
-                fmt::print("\nUpdate downloaded and staged successfully.\n");
+            fmt::print("Checking for {} updates...\n", forced_channel.isEmpty() ? "latest" : forced_channel.toStdString());
 
-#ifdef _WIN32
-                fmt::print("Launching update helper and restarting Citron...\n");
-                if (service->LaunchUpdateHelper()) {
+            QObject::connect(service, &Updater::UpdaterService::UpdateCheckCompleted, [&](bool has_update, const Updater::UpdateInfo& info) {
+                if (!has_update) {
+                    fmt::print("You are already on the latest version ({})\n", service->GetCurrentVersion(forced_channel));
                     app.quit();
                 } else {
-                    fmt::print("Error: Could not launch update helper. Please run 'update_staging/apply_update.bat' manually.\n");
+                    int selected_index = 0;
+                    if (info.download_options.size() > 1) {
+                        fmt::print("\nNew version found: {}\n", info.version);
+                        fmt::print("Multiple variants found. Please select one:\n");
+                        for (size_t k = 0; k < info.download_options.size(); ++k) {
+                            fmt::print(" [{}] {}\n", k, info.download_options[k].name);
+                        }
+                        fmt::print("Select variant index (default 0): ");
+
+                        std::string input;
+                        std::getline(std::cin, input);
+                        try {
+                            if (!input.empty()) selected_index = std::stoi(input);
+                        } catch (...) { selected_index = 0; }
+
+                        if (selected_index < 0 || selected_index >= static_cast<int>(info.download_options.size())) {
+                            fmt::print("Invalid selection. Aborting.\n");
+                            app.exit(1);
+                            return;
+                        }
+                    }
+
+                    fmt::print("Downloading: {}\n", info.download_options[selected_index].name);
+                    service->DownloadAndInstallUpdate(info.download_options[selected_index].url);
+                }
+            });
+
+            QObject::connect(service, &Updater::UpdaterService::UpdateDownloadProgress, [](int percentage, qint64 received, qint64 total) {
+                double received_mb = static_cast<double>(received) / 1024.0 / 1024.0;
+                double total_mb = static_cast<double>(total) / 1024.0 / 1024.0;
+
+                fmt::print("\rDownloading: [");
+                int pos = percentage / 5;
+                for (int j = 0; j < 20; ++j) {
+                    if (j < pos) fmt::print("="); else if (j == pos) fmt::print(">"); else fmt::print(" ");
+                }
+                fmt::print("] {}% ({:.2f} MB / {:.2f} MB)", percentage, received_mb, total_mb);
+                fflush(stdout);
+            });
+
+            QObject::connect(service, &Updater::UpdaterService::UpdateCompleted, [&](Updater::UpdaterService::UpdateResult result, const QString& message) {
+                fmt::print("\n");
+
+                if (result == Updater::UpdaterService::UpdateResult::Success) {
+#ifdef _WIN32
+                    fmt::print("Update downloaded and staged successfully.\n");
+                    fmt::print("Launching update helper and restarting Citron...\n");
+                    if (service->LaunchUpdateHelper()) {
+                        app.quit();
+                    } else {
+                        fmt::print("Error: Could not launch update helper. Please run 'update_staging/apply_update.bat' manually.\n");
+                        app.exit(1);
+                    }
+#else
+                    const char* appimage_env = qgetenv("APPIMAGE").constData();
+                    if (appimage_env && strlen(appimage_env) > 0) {
+                        fmt::print("Update applied successfully to: {}\n", appimage_env);
+                        fmt::print("Please restart Citron to use the new version.\n");
+                    } else {
+                        fmt::print("Update downloaded successfully.\n");
+                    }
+                    app.quit();
+#endif
+                } else {
+                    fmt::print("Update failed: {}\n", message.toStdString());
                     app.exit(1);
                 }
-#else
-                fmt::print("Please restart Citron to apply the update.\n");
-                app.quit();
-#endif
-            } else {
-                fmt::print("\nUpdate failed: {}\n", message.toStdString());
+            });
+
+            QObject::connect(service, &Updater::UpdaterService::UpdateError, [&](const QString& err) {
+                fmt::print("\nError: {}\n", err.toStdString());
                 app.exit(1);
-            }
-        });
+            });
 
-        QObject::connect(service, &Updater::UpdaterService::UpdateError, [&](const QString& err) {
-            fmt::print("\nError during update: {}\n", err.toStdString());
-            app.exit(1);
-        });
-
-        service->CheckForUpdates(forced_channel);
-        return app.exec();
+            service->CheckForUpdates(forced_channel);
+            return app.exec();
+        }
     }
-}
 
     // Set environment variables for AppImage compatibility
     // This must be done before the QApplication is created.
