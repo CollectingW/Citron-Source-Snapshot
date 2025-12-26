@@ -5,9 +5,11 @@
 
 #include <QDialog>
 #include <memory>
+#include <string>
 #include "citron/updater/updater_service.h"
 
 class QString;
+class QTimer;
 
 namespace Ui {
     class UpdaterDialog;
@@ -15,9 +17,8 @@ namespace Ui {
 
 namespace Updater {
 
-    // Declarations for helper functions
+    // Helper function declarations to satisfy -Werror=missing-declarations
     QString FormatDateTimeString(const std::string& iso_string);
-
     QString FormatChangelog(const std::string& raw_changelog);
 
     class UpdaterDialog : public QDialog {
@@ -29,8 +30,11 @@ namespace Updater {
 
         void CheckForUpdates();
 
-    private slots:
+        // Public methods for main.cpp to trigger the automated update flow
         void OnUpdateCheckCompleted(bool has_update, const Updater::UpdateInfo& update_info);
+        void StartUpdateImmediate();
+
+    private slots:
         void OnUpdateDownloadProgress(int percentage, qint64 bytes_received, qint64 bytes_total);
         void OnUpdateInstallProgress(int percentage, const QString& current_file);
         void OnUpdateCompleted(Updater::UpdaterService::UpdateResult result, const QString& message);
