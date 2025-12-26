@@ -6101,43 +6101,52 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // If we are using CLI commands, attach to the terminal so we can see fmt::print output
+    // If we are using CLI commands, attach to the terminal so we can see output
     if (has_cli_arg) {
         if (AttachConsole(ATTACH_PARENT_PROCESS)) {
-            // Redirect standard output/error to the terminal window
-            auto redirect = [](DWORD std_handle, FILE* stream, const char* mode) {
-                HANDLE h = GetStdHandle(std_handle);
-                if (h != INVALID_HANDLE_VALUE) {
-                    int fd = _open_osfhandle((intptr_t)h, _O_TEXT);
-                    if (fd != -1) {
-                        FILE* fp = _fdopen(fd, mode);
-                        if (fp) {
-                            *stream = *fp;
-                            setvbuf(stream, NULL, _IONBF, 0);
-                        }
-                    }
-                }
-            };
-            redirect(STD_OUTPUT_HANDLE, stdout, "w");
-            redirect(STD_ERROR_HANDLE, stderr, "w");
-            redirect(STD_INPUT_HANDLE, stdin, "r");
-            std::ios::sync_with_stdio();
+            // Using freopen_s is the most reliable way on Windows to redirect
+            // stdout/stderr/stdin back to the parent console (CMD/PowerShell)
+            FILE* fpStdout = nullptr;
+            FILE* fpStderr = nullptr;
+            FILE* fpStdin  = nullptr;
+
+            freopen_s(&fpStdout, "CONOUT$", "w", stdout);
+            freopen_s(&fpStderr, "CONOUT$", "w", stderr);
+            freopen_s(&fpStdin,  "CONIN$",  "r", stdin);
+
+            // Sync C++ streams (std::cout, etc) with the new C streams
+            std::ios::sync_with_stdio(true);
+
+            // Clear any error states on streams
+            std::cout.clear();
+            std::cerr.clear();
+            std::cin.clear();
         }
     }
-
 #endif
+
+    const bool is_appimage = !qgetenv("APPIMAGE").isEmpty();
+    if (is_appimage) {
+        // Fixes Wayland crash with NVIDIA drivers by disabling explicit sync.
+        qputenv("QT_WAYLAND_DISABLE_EXPLICIT_SYNC", "1");
+
+        // Tell the bundled OpenSSL where to find the bundled certificates.
+        QString app_dir_path = QFileInfo(QString::fromLocal8Bit(argv[0])).absolutePath();
+        QDir app_dir(app_dir_path);
+        const QString certs_path = app_dir.filePath(QString::fromLatin1("../etc/ssl/certs"));
+        qputenv("SSL_CERT_DIR", certs_path.toUtf8());
+    }
 
     // 1. Programmatic Version Output
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-v" || arg == "--version") {
-            // This will now correctly appear in CMD/PowerShell
             fmt::print("citron {}| {} ({})\n", Common::g_build_fullname, Common::g_citron_version, Common::g_citron_hash);
             return 0;
         }
     }
 
-    // 2. Headless Update Flag
+    // 2. Headless Update Flag Logic
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--update") {
             QString forced_channel;
@@ -6148,10 +6157,12 @@ int main(int argc, char* argv[]) {
                 }
             }
 
+            // Create a Core application for the headless update process
             QCoreApplication app(argc, argv);
             auto* service = new Updater::UpdaterService(&app);
 
             fmt::print("Checking for {} updates...\n", forced_channel.isEmpty() ? "latest" : forced_channel.toStdString());
+            std::fflush(stdout);
 
             QObject::connect(service, &Updater::UpdaterService::UpdateCheckCompleted, [&](bool has_update, const Updater::UpdateInfo& info) {
                 if (!has_update) {
@@ -6166,6 +6177,7 @@ int main(int argc, char* argv[]) {
                             fmt::print(" [{}] {}\n", k, info.download_options[k].name);
                         }
                         fmt::print("Select variant index (default 0): ");
+                        std::fflush(stdout);
 
                         std::string input;
                         std::getline(std::cin, input);
@@ -6181,6 +6193,7 @@ int main(int argc, char* argv[]) {
                     }
 
                     fmt::print("Downloading: {}\n", info.download_options[selected_index].name);
+                    std::fflush(stdout);
                     service->DownloadAndInstallUpdate(info.download_options[selected_index].url);
                 }
             });
@@ -6190,7 +6203,6 @@ int main(int argc, char* argv[]) {
 
                 fmt::print("\rDownloading: [");
                 if (total > 0) {
-                    // We know the size, show a proper bar
                     int pos = percentage / 5;
                     for (int j = 0; j < 20; ++j) {
                         if (j < pos) fmt::print("="); else if (j == pos) fmt::print(">"); else fmt::print(" ");
@@ -6198,13 +6210,12 @@ int main(int argc, char* argv[]) {
                     double total_mb = static_cast<double>(total) / 1024.0 / 1024.0;
                     fmt::print("] {}% ({:.2f} MB / {:.2f} MB)", percentage, received_mb, total_mb);
                 } else {
-                    // Size is unknown, show a "spinner" or just bytes
                     static int spinner = 0;
                     const char* chars = "|/-\\";
                     fmt::print(" {} ", chars[spinner++ % 4]);
                     fmt::print("                   ] (Size unknown) {:.2f} MB received", received_mb);
                 }
-                fflush(stdout);
+                std::fflush(stdout);
             });
 
             QObject::connect(service, &Updater::UpdaterService::UpdateCompleted, [&](Updater::UpdaterService::UpdateResult result, const QString& message) {
@@ -6237,7 +6248,7 @@ int main(int argc, char* argv[]) {
             });
 
             QObject::connect(service, &Updater::UpdaterService::UpdateError, [&](const QString& err) {
-                fmt::print("\nError: {}\n", err.toStdString());
+                fmt::print("\nError during update: {}\n", err.toStdString());
                 app.exit(1);
             });
 
@@ -6246,23 +6257,13 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Set environment variables for AppImage compatibility
-    // This must be done before the QApplication is created.
-    const bool is_appimage = !qgetenv("APPIMAGE").isEmpty();
-    if (is_appimage) {
-        // Fixes Wayland crash with NVIDIA drivers by disabling explicit sync.
-        qputenv("QT_WAYLAND_DISABLE_EXPLICIT_SYNC", "1");
-
-        // Tell the bundled OpenSSL where to find the bundled certificates.
-        const QDir app_dir(QCoreApplication::applicationDirPath());
-        const QString certs_path = app_dir.filePath(QString::fromLatin1("../etc/ssl/certs"));
-        qputenv("SSL_CERT_DIR", certs_path.toUtf8());
-    }
+    // --- STANDARD STARTUP LOGIC ---
 
     std::unique_ptr<QtConfig> config = std::make_unique<QtConfig>();
     UISettings::RestoreWindowState(config);
     bool has_broken_vulkan = false;
     bool is_child = false;
+
     if (CheckEnvVars(&is_child)) {
         return 0;
     }
@@ -6284,73 +6285,54 @@ int main(int argc, char* argv[]) {
 
     Common::ConfigureNvidiaEnvironmentFlags();
 
-    // Init settings params
     QCoreApplication::setOrganizationName(QStringLiteral("citron team"));
     QCoreApplication::setApplicationName(QStringLiteral("citron"));
 
 #ifdef _WIN32
-    // Increases the maximum open file limit to 8192
     _setmaxstdio(8192);
 #endif
 
 #ifdef __APPLE__
-    // If you start a bundle (binary) on OSX without the Terminal, the working directory is "/".
-    // But since we require the working directory to be the executable path for the location of
-    // the user folder in the Qt Frontend, we need to cd into that working directory
     const auto bin_path = Common::FS::GetBundleDirectory() / "..";
     chdir(Common::FS::PathToUTF8String(bin_path).c_str());
 #endif
 
 #ifdef __linux__
-    // Set the DISPLAY variable in order to open web browsers
-    // TODO (lat9nq): Find a better solution for AppImages to start external applications
     if (QString::fromLocal8Bit(qgetenv("DISPLAY")).isEmpty()) {
         qputenv("DISPLAY", ":0");
     }
-
-    // Fix the Wayland appId. This needs to match the name of the .desktop file without the .desktop
-    // suffix.
     QGuiApplication::setDesktopFileName(QStringLiteral("org.citron_emu.citron"));
 #endif
 
     SetHighDPIAttributes();
 
 #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
-    // Disables the "?" button on all dialogs. Disabled by default on Qt6.
     QCoreApplication::setAttribute(Qt::AA_DisableWindowContextHelpButton);
 #endif
 
-    // Enables the core to make the qt created contexts current on std::threads
     QCoreApplication::setAttribute(Qt::AA_DontCheckOpenGLContextThreadAffinity);
 
     QApplication app(argc, argv);
+
 #ifdef __linux__
     if (QGuiApplication::platformName().startsWith(QStringLiteral("wayland"))) {
         Settings::values.is_wayland_platform.SetValue(true);
     }
 #endif
 
-    #ifdef CITRON_USE_AUTO_UPDATER
-    // Check for and apply staged updates before starting the main application
-    std::filesystem::path app_dir = std::filesystem::path(QCoreApplication::applicationDirPath().toStdString());
+#ifdef CITRON_USE_AUTO_UPDATER
+    std::filesystem::path app_dir_fs = std::filesystem::path(QCoreApplication::applicationDirPath().toStdString());
 
 #ifdef _WIN32
-    // On Windows, updates are applied by the helper script after the app exits.
-    // If we find a staging directory here, it means the helper script failed.
-    // Clean it up to avoid confusion.
-    std::filesystem::path staging_path = app_dir / "update_staging";
+    std::filesystem::path staging_path = app_dir_fs / "update_staging";
     if (std::filesystem::exists(staging_path)) {
         try {
             std::filesystem::remove_all(staging_path);
-        } catch (...) {
-            // Ignore cleanup errors
-        }
+        } catch (...) {}
     }
 #else
-    // On Linux, apply staged updates at startup as before
-    if (Updater::UpdaterService::HasStagedUpdate(app_dir)) {
-        if (Updater::UpdaterService::ApplyStagedUpdate(app_dir)) {
-            // Show a simple message that update was applied
+    if (Updater::UpdaterService::HasStagedUpdate(app_dir_fs)) {
+        if (Updater::UpdaterService::ApplyStagedUpdate(app_dir_fs)) {
             QMessageBox::information(nullptr, QObject::tr("Update Applied"),
                                      QObject::tr("Citron has been updated successfully!"));
         }
@@ -6362,10 +6344,6 @@ int main(int argc, char* argv[]) {
     OverrideWindowsFont();
 #endif
 
-    // Workaround for QTBUG-85409, for Suzhou numerals the number 1 is actually \u3021
-    // so we can see if we get \u3008 instead
-    // TL;DR all other number formats are consecutive in unicode code points
-    // This bug is fixed in Qt6, specifically 6.0.0-alpha1
 #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
     const QLocale locale = QLocale::system();
     if (QStringLiteral("\u3008") == locale.toString(1)) {
@@ -6373,8 +6351,6 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
-    // Qt changes the locale and causes issues in float conversion using std::to_string() when
-    // generating shaders
     setlocale(LC_ALL, "C");
 
     GMainWindow main_window{std::move(config), has_broken_vulkan};
