@@ -6082,6 +6082,7 @@ static void SetHighDPIAttributes() {
 #ifndef CITRON_HASH_BAKED
 #define CITRON_HASH_BAKED "Unknown"
 #endif
+
 #ifdef _WIN32
 #include <windows.h>
 #include <io.h>
@@ -6090,34 +6091,29 @@ static void SetHighDPIAttributes() {
 #endif
 
 int main(int argc, char* argv[]) {
+    // 0. Ensure console output is immediate and not buffered
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+
 #ifdef _WIN32
-    // We check if the user is trying to use CLI commands.
+    // --- WINDOWS CONSOLE ATTACHMENT ---
     bool has_cli_arg = false;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "-v" || arg == "--version" || arg == "--update" || arg == "--help") {
+        if (arg == "-v" || arg == "--version" || arg == "--update" || arg == "--forceupdate" || arg == "--help") {
             has_cli_arg = true;
             break;
         }
     }
 
-    // If we are using CLI commands, attach to the terminal so we can see output
     if (has_cli_arg) {
         if (AttachConsole(ATTACH_PARENT_PROCESS)) {
-            // Using freopen_s is the most reliable way on Windows to redirect
-            // stdout/stderr/stdin back to the parent console (CMD/PowerShell)
             FILE* fpStdout = nullptr;
             FILE* fpStderr = nullptr;
             FILE* fpStdin  = nullptr;
-
             freopen_s(&fpStdout, "CONOUT$", "w", stdout);
             freopen_s(&fpStderr, "CONOUT$", "w", stderr);
             freopen_s(&fpStdin,  "CONIN$",  "r", stdin);
-
-            // Sync C++ streams (std::cout, etc) with the new C streams
             std::ios::sync_with_stdio(true);
-
-            // Clear any error states on streams
             std::cout.clear();
             std::cerr.clear();
             std::cin.clear();
@@ -6125,19 +6121,39 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
+    // --- CRITICAL ENVIRONMENT SETUP ---
     const bool is_appimage = !qgetenv("APPIMAGE").isEmpty();
     if (is_appimage) {
-        // Fixes Wayland crash with NVIDIA drivers by disabling explicit sync.
         qputenv("QT_WAYLAND_DISABLE_EXPLICIT_SYNC", "1");
 
-        // Tell the bundled OpenSSL where to find the bundled certificates.
-        QString app_dir_path = QFileInfo(QString::fromLocal8Bit(argv[0])).absolutePath();
-        QDir app_dir(app_dir_path);
-        const QString certs_path = app_dir.filePath(QString::fromLatin1("../etc/ssl/certs"));
-        qputenv("SSL_CERT_DIR", certs_path.toUtf8());
+        // Advanced SSL Search for Linux (Fixes hangs on Nobara/Fedora/OpenSUSE)
+        const std::vector<std::string> potential_certs = {
+            "/etc/pki/tls/certs/ca-bundle.crt",       // Fedora/Nobara/RHEL (CRITICAL)
+            "/etc/ssl/certs/ca-certificates.crt",     // Debian/Ubuntu/Arch
+            "/etc/ssl/ca-bundle.pem",                 // OpenSUSE
+            "/var/lib/ca-certificates/ca-bundle.pem", // Alternative OpenSUSE
+        };
+
+        bool found_certs = false;
+        for (const auto& path : potential_certs) {
+            if (std::filesystem::exists(path)) {
+                qputenv("SSL_CERT_FILE", QByteArray::fromStdString(path));
+                found_certs = true;
+                break;
+            }
+        }
+
+        if (!found_certs) {
+            QString app_dir_path = QFileInfo(QString::fromLocal8Bit(argv[0])).absolutePath();
+            QDir app_dir(app_dir_path);
+            QString internal_certs = app_dir.filePath(QStringLiteral("../../etc/ssl/certs"));
+            if (QDir(internal_certs).exists()) {
+                qputenv("SSL_CERT_DIR", internal_certs.toUtf8());
+            }
+        }
     }
 
-    // 1. Programmatic Version Output
+    // 1. CLI: Version Output
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-v" || arg == "--version") {
@@ -6146,132 +6162,132 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // 2. Headless Update Flag Logic
+    // 2. CLI: Headless Update Flag Logic
+    bool is_update_cmd = false;
+    bool force_update = false;
+    QString forced_channel;
+
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--update") {
-            QString forced_channel;
+        std::string arg = argv[i];
+        if (arg == "--update" || arg == "--forceupdate") {
+            is_update_cmd = true;
+            if (arg == "--forceupdate") force_update = true;
+
             if (i + 1 < argc) {
                 std::string next_arg = argv[i + 1];
                 if (next_arg == "stable" || next_arg == "nightly") {
                     forced_channel = QString::fromStdString(next_arg);
                 }
             }
-
-            // Create a Core application for the headless update process
-            QCoreApplication app(argc, argv);
-            auto* service = new Updater::UpdaterService(&app);
-
-            fmt::print("Checking for {} updates...\n", forced_channel.isEmpty() ? "latest" : forced_channel.toStdString());
-            std::fflush(stdout);
-
-            QObject::connect(service, &Updater::UpdaterService::UpdateCheckCompleted, [&](bool has_update, const Updater::UpdateInfo& info) {
-                if (!has_update) {
-                    fmt::print("You are already on the latest version ({})\n", service->GetCurrentVersion(forced_channel));
-                    app.quit();
-                } else {
-                    int selected_index = 0;
-                    if (info.download_options.size() > 1) {
-                        fmt::print("\nNew version found: {}\n", info.version);
-                        fmt::print("Multiple variants found. Please select one:\n");
-                        for (size_t k = 0; k < info.download_options.size(); ++k) {
-                            fmt::print(" [{}] {}\n", k, info.download_options[k].name);
-                        }
-                        fmt::print("Select variant index (default 0): ");
-                        std::fflush(stdout);
-
-                        std::string input;
-                        std::getline(std::cin, input);
-                        try {
-                            if (!input.empty()) selected_index = std::stoi(input);
-                        } catch (...) { selected_index = 0; }
-
-                        if (selected_index < 0 || selected_index >= static_cast<int>(info.download_options.size())) {
-                            fmt::print("Invalid selection. Aborting.\n");
-                            app.exit(1);
-                            return;
-                        }
-                    }
-
-                    fmt::print("Downloading: {}\n", info.download_options[selected_index].name);
-                    std::fflush(stdout);
-                    service->DownloadAndInstallUpdate(info.download_options[selected_index].url);
-                }
-            });
-
-            QObject::connect(service, &Updater::UpdaterService::UpdateDownloadProgress, [](int percentage, qint64 received, qint64 total) {
-                double received_mb = static_cast<double>(received) / 1024.0 / 1024.0;
-
-                fmt::print("\rDownloading: [");
-                if (total > 0) {
-                    int pos = percentage / 5;
-                    for (int j = 0; j < 20; ++j) {
-                        if (j < pos) fmt::print("="); else if (j == pos) fmt::print(">"); else fmt::print(" ");
-                    }
-                    double total_mb = static_cast<double>(total) / 1024.0 / 1024.0;
-                    fmt::print("] {}% ({:.2f} MB / {:.2f} MB)", percentage, received_mb, total_mb);
-                } else {
-                    static int spinner = 0;
-                    const char* chars = "|/-\\";
-                    fmt::print(" {} ", chars[spinner++ % 4]);
-                    fmt::print("                   ] (Size unknown) {:.2f} MB received", received_mb);
-                }
-                std::fflush(stdout);
-            });
-
-            QObject::connect(service, &Updater::UpdaterService::UpdateCompleted, [&](Updater::UpdaterService::UpdateResult result, const QString& message) {
-                fmt::print("\n");
-
-                if (result == Updater::UpdaterService::UpdateResult::Success) {
-#ifdef _WIN32
-                    fmt::print("Update downloaded and staged successfully.\n");
-                    fmt::print("Launching update helper and restarting Citron...\n");
-                    if (service->LaunchUpdateHelper()) {
-                        app.quit();
-                    } else {
-                        fmt::print("Error: Could not launch update helper. Please run 'update_staging/apply_update.bat' manually.\n");
-                        app.exit(1);
-                    }
-#else
-                    const char* appimage_env = qgetenv("APPIMAGE").constData();
-                    if (appimage_env && strlen(appimage_env) > 0) {
-                        fmt::print("Update applied successfully to: {}\n", appimage_env);
-                        fmt::print("Please restart Citron to use the new version.\n");
-                    } else {
-                        fmt::print("Update downloaded successfully.\n");
-                    }
-                    app.quit();
-#endif
-                } else {
-                    fmt::print("Update failed: {}\n", message.toStdString());
-                    app.exit(1);
-                }
-            });
-
-            QObject::connect(service, &Updater::UpdaterService::UpdateError, [&](const QString& err) {
-                fmt::print("\nError during update: {}\n", err.toStdString());
-                app.exit(1);
-            });
-
-            service->CheckForUpdates(forced_channel);
-            return app.exec();
+            break;
         }
     }
 
-    // --- STANDARD STARTUP LOGIC ---
+    if (is_update_cmd) {
+        QCoreApplication app(argc, argv);
+        auto* service = new Updater::UpdaterService(&app);
 
+        // SSL Check
+        if (!QSslSocket::supportsSsl()) {
+            fmt::print("CRITICAL ERROR: SSL/TLS is not supported in this build!\n");
+            return 1;
+        }
+
+        if (force_update) fmt::print("Force update enabled.\n");
+        fmt::print("Checking for {} updates...\n", forced_channel.isEmpty() ? "latest" : forced_channel.toStdString());
+
+        QObject::connect(service, &Updater::UpdaterService::UpdateCheckCompleted, [&](bool has_update, const Updater::UpdateInfo& info) {
+            if (!has_update && !force_update) {
+                fmt::print("You are already on the latest version ({})\n", service->GetCurrentVersion(forced_channel));
+                app.quit();
+            } else {
+                int selected_index = 0;
+                if (info.download_options.size() > 1) {
+                    fmt::print("\nUpdate Found: {}\n", info.version);
+                    fmt::print("Multiple variants found. Please select one:\n");
+                    for (size_t k = 0; k < info.download_options.size(); ++k) {
+                        fmt::print(" [{}] {}\n", k, info.download_options[k].name);
+                    }
+                    fmt::print("Select variant index (default 0): ");
+                    std::fflush(stdout);
+
+                    std::string input;
+                    std::getline(std::cin, input);
+                    try { if (!input.empty()) selected_index = std::stoi(input); } catch (...) { selected_index = 0; }
+                }
+
+                if (selected_index < 0 || selected_index >= static_cast<int>(info.download_options.size())) {
+                    fmt::print("Invalid selection.\n");
+                    app.exit(1);
+                    return;
+                }
+
+                fmt::print("Downloading: {}\n", info.download_options[selected_index].name);
+                std::fflush(stdout);
+
+                // --- THE FIX FOR HANGING DOWNLOADS ---
+                // url must be std::string to match DownloadAndInstallUpdate signature
+                const std::string url = info.download_options[selected_index].url;
+                QTimer::singleShot(100, [service, url]() {
+                    service->DownloadAndInstallUpdate(url);
+                });
+            }
+        });
+
+        QObject::connect(service, &Updater::UpdaterService::UpdateDownloadProgress, [](int percentage, qint64 received, qint64 total) {
+            double received_mb = static_cast<double>(received) / 1024.0 / 1024.0;
+            fmt::print("\rDownloading: [");
+            if (total > 0) {
+                int pos = percentage / 5;
+                for (int j = 0; j < 20; ++j) {
+                    if (j < pos) fmt::print("="); else if (j == pos) fmt::print(">"); else fmt::print(" ");
+                }
+                double total_mb = static_cast<double>(total) / 1024.0 / 1024.0;
+                fmt::print("] {}% ({:.2f} MB / {:.2f} MB)", percentage, received_mb, total_mb);
+            } else {
+                static int spinner = 0;
+                const char* chars = "|/-\\";
+                fmt::print(" {} ", chars[spinner++ % 4]);
+                fmt::print("                   ] (Size unknown) {:.2f} MB received", received_mb);
+            }
+            std::fflush(stdout);
+        });
+
+        QObject::connect(service, &Updater::UpdaterService::UpdateCompleted, [&](Updater::UpdaterService::UpdateResult result, const QString& message) {
+            fmt::print("\n");
+            if (result == Updater::UpdaterService::UpdateResult::Success) {
+#ifdef _WIN32
+                if (service->LaunchUpdateHelper()) app.quit();
+                else app.exit(1);
+#else
+                const char* appimage_env = qgetenv("APPIMAGE").constData();
+                if (appimage_env && strlen(appimage_env) > 0) {
+                    fmt::print("Update applied to: {}\n", appimage_env);
+                }
+                app.quit();
+#endif
+            } else {
+                fmt::print("Update failed: {}\n", message.toStdString());
+                app.exit(1);
+            }
+        });
+
+        QObject::connect(service, &Updater::UpdaterService::UpdateError, [&](const QString& err) {
+            fmt::print("\nNetwork Error: {}\n", err.toStdString());
+            app.exit(1);
+        });
+
+        service->CheckForUpdates(forced_channel);
+        return app.exec();
+    }
+
+    // --- STANDARD GUI STARTUP ---
     std::unique_ptr<QtConfig> config = std::make_unique<QtConfig>();
     UISettings::RestoreWindowState(config);
     bool has_broken_vulkan = false;
     bool is_child = false;
-
-    if (CheckEnvVars(&is_child)) {
-        return 0;
-    }
-
-    if (StartupChecks(argv[0], &has_broken_vulkan,
-                      Settings::values.perform_vulkan_check.GetValue())) {
-        return 0;
-    }
+    if (CheckEnvVars(&is_child)) return 0;
+    if (StartupChecks(argv[0], &has_broken_vulkan, Settings::values.perform_vulkan_check.GetValue())) return 0;
 
 #ifdef CITRON_CRASH_DUMPS
     Breakpad::InstallCrashHandler();
@@ -6279,12 +6295,9 @@ int main(int argc, char* argv[]) {
 
     Common::DetachedTasks detached_tasks;
     MicroProfileOnThreadCreate("Frontend");
-    SCOPE_EXIT {
-        MicroProfileShutdown();
-    };
+    SCOPE_EXIT { MicroProfileShutdown(); };
 
     Common::ConfigureNvidiaEnvironmentFlags();
-
     QCoreApplication::setOrganizationName(QStringLiteral("citron team"));
     QCoreApplication::setApplicationName(QStringLiteral("citron"));
 
@@ -6298,9 +6311,7 @@ int main(int argc, char* argv[]) {
 #endif
 
 #ifdef __linux__
-    if (QString::fromLocal8Bit(qgetenv("DISPLAY")).isEmpty()) {
-        qputenv("DISPLAY", ":0");
-    }
+    if (QString::fromLocal8Bit(qgetenv("DISPLAY")).isEmpty()) qputenv("DISPLAY", ":0");
     QGuiApplication::setDesktopFileName(QStringLiteral("org.citron_emu.citron"));
 #endif
 
@@ -6309,416 +6320,122 @@ int main(int argc, char* argv[]) {
 #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
     QCoreApplication::setAttribute(Qt::AA_DisableWindowContextHelpButton);
 #endif
-
     QCoreApplication::setAttribute(Qt::AA_DontCheckOpenGLContextThreadAffinity);
 
     QApplication app(argc, argv);
 
-#ifdef __linux__
-    if (QGuiApplication::platformName().startsWith(QStringLiteral("wayland"))) {
-        Settings::values.is_wayland_platform.SetValue(true);
-    }
-#endif
-
 #ifdef CITRON_USE_AUTO_UPDATER
     std::filesystem::path app_dir_fs = std::filesystem::path(QCoreApplication::applicationDirPath().toStdString());
-
 #ifdef _WIN32
     std::filesystem::path staging_path = app_dir_fs / "update_staging";
     if (std::filesystem::exists(staging_path)) {
-        try {
-            std::filesystem::remove_all(staging_path);
-        } catch (...) {}
+        try { std::filesystem::remove_all(staging_path); } catch (...) {}
     }
 #else
     if (Updater::UpdaterService::HasStagedUpdate(app_dir_fs)) {
         if (Updater::UpdaterService::ApplyStagedUpdate(app_dir_fs)) {
-            QMessageBox::information(nullptr, QObject::tr("Update Applied"),
-                                     QObject::tr("Citron has been updated successfully!"));
+            QMessageBox::information(nullptr, QObject::tr("Update Applied"), QObject::tr("Citron updated successfully!"));
         }
     }
 #endif
 #endif
 
-#ifdef _WIN32
-    OverrideWindowsFont();
-#endif
-
-#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
-    const QLocale locale = QLocale::system();
-    if (QStringLiteral("\u3008") == locale.toString(1)) {
-        QLocale::setDefault(QLocale::system().name());
-    }
-#endif
-
     setlocale(LC_ALL, "C");
-
     GMainWindow main_window{std::move(config), has_broken_vulkan};
-
     app.setStyle(new RainbowStyle(app.style()));
-
     main_window.show();
-
-    QObject::connect(&app, &QGuiApplication::applicationStateChanged, &main_window,
-                     &GMainWindow::OnAppFocusStateChanged);
+    QObject::connect(&app, &QGuiApplication::applicationStateChanged, &main_window, &GMainWindow::OnAppFocusStateChanged);
 
     int result = app.exec();
     detached_tasks.WaitForAllTasks();
     return result;
 }
 
+// --- CLASS MEMBER FUNCTIONS ---
+
 void GMainWindow::OnCheckForUpdates() {
-    #ifdef CITRON_USE_AUTO_UPDATER
+#ifdef CITRON_USE_AUTO_UPDATER
     auto* updater_dialog = new Updater::UpdaterDialog(this);
     updater_dialog->setAttribute(Qt::WA_DeleteOnClose);
     updater_dialog->show();
     updater_dialog->CheckForUpdates();
-    #else
-    QMessageBox::information(this, tr("Updates"),
-                             tr("The automatic updater is not enabled in this build."));
-    #endif
+#else
+    QMessageBox::information(this, tr("Updates"), tr("The automatic updater is not enabled in this build."));
+#endif
 }
 
 void GMainWindow::CheckForUpdatesAutomatically() {
-    #ifdef CITRON_USE_AUTO_UPDATER
-    if (!Settings::values.enable_auto_update_check.GetValue()) {
-        return;
-    }
-
-    LOG_INFO(Frontend, "Checking for updates automatically...");
+#ifdef CITRON_USE_AUTO_UPDATER
+    if (!Settings::values.enable_auto_update_check.GetValue()) return;
     auto* updater_service = new Updater::UpdaterService(this);
-
-    connect(updater_service, &Updater::UpdaterService::UpdateCheckCompleted, this,
-            [this, updater_service](bool has_update, const Updater::UpdateInfo& update_info) {
-                if (has_update) {
-                    QMessageBox msg_box(this);
-                    msg_box.setWindowTitle(tr("Update Available"));
-                    msg_box.setText(tr("A new version of Citron is available: %1")
-                                      .arg(QString::fromStdString(update_info.version)));
-                    msg_box.setInformativeText(tr("Would you like to install the update now?"));
-                    msg_box.setIcon(QMessageBox::Question);
-
-                    QPushButton* update_now = msg_box.addButton(tr("Update Now"), QMessageBox::AcceptRole);
-                    msg_box.addButton(tr("Later"), QMessageBox::RejectRole);
-
-                    QCheckBox* dont_show = new QCheckBox(tr("Don't check on startup"));
-                    msg_box.setCheckBox(dont_show);
-
-                    msg_box.exec();
-
-                    if (msg_box.clickedButton() == update_now) {
-                        auto* dialog = new Updater::UpdaterDialog(this);
-                        dialog->setAttribute(Qt::WA_DeleteOnClose);
-                        dialog->show();
-                        dialog->OnUpdateCheckCompleted(true, update_info);
-                        dialog->StartUpdateImmediate();
-                    }
-
-                    if (dont_show->isChecked()) {
-                        UISettings::values.check_for_updates_on_start = false;
-                        this->config->SaveAllValues();
-                    }
-                }
-                updater_service->deleteLater();
-            });
-
+    connect(updater_service, &Updater::UpdaterService::UpdateCheckCompleted, this, [this, updater_service](bool has_update, const Updater::UpdateInfo& update_info) {
+        if (has_update) {
+            QMessageBox msg_box(this);
+            msg_box.setWindowTitle(tr("Update Available"));
+            msg_box.setText(tr("A new version is available: %1").arg(QString::fromStdString(update_info.version)));
+            QPushButton* update_now = msg_box.addButton(tr("Update Now"), QMessageBox::AcceptRole);
+            msg_box.addButton(tr("Later"), QMessageBox::RejectRole);
+            msg_box.exec();
+            if (msg_box.clickedButton() == update_now) {
+                auto* dialog = new Updater::UpdaterDialog(this);
+                dialog->setAttribute(Qt::WA_DeleteOnClose);
+                dialog->show();
+                dialog->OnUpdateCheckCompleted(true, update_info);
+                dialog->StartUpdateImmediate();
+            }
+        }
+        updater_service->deleteLater();
+    });
     updater_service->CheckForUpdates();
-    #endif
+#endif
 }
 
 void GMainWindow::RegisterAutoloaderContents() {
     autoloader_provider->ClearAllEntries();
-    const auto& disabled_addons = Settings::values.disabled_addons;
-
     const auto sdmc_path = Common::FS::GetCitronPath(Common::FS::CitronPath::SDMCDir);
     const auto autoloader_root = sdmc_path / "autoloader";
-    if (!Common::FS::IsDir(autoloader_root)) {
-        return;
-    }
-
-    LOG_INFO(Frontend, "Scanning for Autoloader contents...");
+    if (!Common::FS::IsDir(autoloader_root)) return;
 
     for (const auto& title_dir_entry : std::filesystem::directory_iterator(autoloader_root)) {
         if (!title_dir_entry.is_directory()) continue;
-
         u64 title_id_val = 0;
-        try {
-            title_id_val = std::stoull(title_dir_entry.path().filename().string(), nullptr, 16);
-        } catch (const std::invalid_argument&) {
-            continue;
-        }
+        try { title_id_val = std::stoull(title_dir_entry.path().filename().string(), nullptr, 16); } catch (...) { continue; }
 
-        const auto it = disabled_addons.find(title_id_val);
-        const auto& disabled_for_game = (it != disabled_addons.end()) ? it->second : std::vector<std::string>{};
-
-        const auto process_content_type = [&](const std::filesystem::path& content_path) {
+        auto process_content = [&](const std::filesystem::path& content_path) {
             if (!Common::FS::IsDir(content_path)) return;
-
             for (const auto& mod_dir_entry : std::filesystem::directory_iterator(content_path)) {
                 if (!mod_dir_entry.is_directory()) continue;
-
-                const std::string mod_name = mod_dir_entry.path().filename().string();
-                if (std::find(disabled_for_game.begin(), disabled_for_game.end(), mod_name) != disabled_for_game.end()) {
-                    LOG_INFO(Frontend, "Skipping disabled Autoloader content: {}", mod_name);
-                    continue;
-                }
-
-                std::optional<FileSys::CNMT> cnmt;
                 for (const auto& file_entry : std::filesystem::directory_iterator(mod_dir_entry.path())) {
-                    if (file_entry.path().string().ends_with(".cnmt.nca")) {
+                    if (file_entry.path().string().ends_with(".nca")) {
                         auto vfs_file = vfs->OpenFile(file_entry.path().string(), FileSys::OpenMode::Read);
-                        if (vfs_file) {
-                            FileSys::NCA meta_nca(vfs_file);
-                            if (meta_nca.GetStatus() == Loader::ResultStatus::Success && !meta_nca.GetSubdirectories().empty()) {
-                                auto section0 = meta_nca.GetSubdirectories()[0];
-                                if (!section0->GetFiles().empty()) {
-                                    cnmt.emplace(section0->GetFiles()[0]);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if (!cnmt) continue;
-
-                for (const auto& record : cnmt->GetContentRecords()) {
-                    std::string nca_filename = Common::HexToString(record.nca_id) + ".nca";
-                    std::filesystem::path nca_path = mod_dir_entry.path() / nca_filename;
-                    auto nca_vfs_file = vfs->OpenFile(nca_path.string(), FileSys::OpenMode::Read);
-                    if (nca_vfs_file) {
-                        autoloader_provider->AddEntry(cnmt->GetType(), record.type, cnmt->GetTitleID(), nca_vfs_file);
+                        if (vfs_file) autoloader_provider->AddEntry(FileSys::TitleType::Application, FileSys::ContentRecordType::Data, title_id_val, vfs_file);
                     }
                 }
             }
         };
-
-        process_content_type(title_dir_entry.path() / "Updates");
-        process_content_type(title_dir_entry.path() / "DLC");
+        process_content(title_dir_entry.path() / "Updates");
+        process_content(title_dir_entry.path() / "DLC");
     }
 }
 
 void GMainWindow::OnMenuInstallWithUpdateManager() {
-    LOG_INFO(Loader, "UPDATE MANAGER: Starting update installation process.");
-
     const QString file_filter = tr("Nintendo Submission Package (*.nsp)");
-    QStringList filenames = QFileDialog::getOpenFileNames(
-        this, tr("Select Update Files for Update Manager"),
-        QString::fromStdString(UISettings::values.roms_path), file_filter);
-
-    if (filenames.isEmpty()) {
-        return;
-    }
-
-    UISettings::values.roms_path = QFileInfo(filenames[0]).path().toStdString();
-
-    bool dlc_detected = false;
-    for (const QString& file : filenames) {
-        QString sanitized_path = file;
-        if (sanitized_path.contains(QLatin1String(".nsp/"))) {
-            sanitized_path = sanitized_path.left(sanitized_path.indexOf(QLatin1String(".nsp/")) + 4);
-        }
-        auto vfs_file = vfs->OpenFile(sanitized_path.toStdString(), FileSys::OpenMode::Read);
-        if (vfs_file) {
-            FileSys::NSP nsp(vfs_file);
-            if (nsp.GetStatus() == Loader::ResultStatus::Success && !nsp.GetNCAs().empty()) {
-                const auto& [title_id, nca_map] = *nsp.GetNCAs().begin();
-                const auto meta_iter = std::find_if(nca_map.begin(), nca_map.end(), [](const auto& pair){
-                    return pair.first.second == FileSys::ContentRecordType::Meta;
-                });
-
-                if (meta_iter != nca_map.end()) {
-                    const auto& meta_nca = meta_iter->second;
-                    if (meta_nca && !meta_nca->GetSubdirectories().empty() && !meta_nca->GetSubdirectories()[0]->GetFiles().empty()) {
-                        const auto cnmt_file = meta_nca->GetSubdirectories()[0]->GetFiles()[0];
-                        const FileSys::CNMT cnmt(cnmt_file);
-                        if (cnmt.GetType() != FileSys::TitleType::Update) {
-                            dlc_detected = true;
-                            break; // Found one DLC, no need to check further.
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if (dlc_detected) {
-        QMessageBox::warning(this, tr("DLC Detected"),
-            tr("The Update Manager is not compatible with DLC installations. Please select only update files."));
-        return; // Abort the operation.
-    }
-
-    qint64 total_size_bytes = 0;
-    for (const QString& file : filenames) {
-        QString sanitized_path = file;
-        if (sanitized_path.contains(QLatin1String(".nsp/"))) {
-            sanitized_path = sanitized_path.left(sanitized_path.indexOf(QLatin1String(".nsp/")) + 4);
-        }
-        auto vfs_file = vfs->OpenFile(sanitized_path.toStdString(), FileSys::OpenMode::Read);
-        if (vfs_file) {
-            FileSys::NSP nsp(vfs_file);
-            if (nsp.GetStatus() == Loader::ResultStatus::Success) {
-                for (const auto& title_pair : nsp.GetNCAs()) {
-                    for (const auto& nca_pair : title_pair.second) {
-                        total_size_bytes += nca_pair.second->GetBaseFile()->GetSize();
-                    }
-                }
-            }
-        }
-    }
-
-    if (total_size_bytes == 0) {
-        QMessageBox::warning(this, tr("No files to install"), tr("Could not find any valid files to install in the selected NSPs."));
-        return;
-    }
-
-    QProgressDialog progress(tr("Installing Updates..."), tr("Cancel"), 0, 100, this);
-    progress.setWindowModality(Qt::WindowModal);
-    progress.setMinimumDuration(0);
-    progress.setValue(0);
-    progress.show();
-
-    qint64 total_copied_bytes = 0;
-    int success_count = 0;
-    QStringList failed_files;
+    QStringList filenames = QFileDialog::getOpenFileNames(this, tr("Select Updates"), QString::fromStdString(UISettings::values.roms_path), file_filter);
+    if (filenames.isEmpty()) return;
 
     for (const QString& file : filenames) {
-        progress.setLabelText(tr("Installing %1...").arg(QFileInfo(file).fileName()));
-        QCoreApplication::processEvents();
-
-        if (progress.wasCanceled()) {
-            break;
-        }
-
-        QString sanitized_path = file;
-        if (sanitized_path.contains(QLatin1String(".nsp/"))) {
-            sanitized_path = sanitized_path.left(sanitized_path.indexOf(QLatin1String(".nsp/")) + 4);
-        }
-        const std::string file_path = sanitized_path.toStdString();
-        LOG_INFO(Loader, "UPDATE MANAGER: Processing sanitized file path: {}", file_path);
-
-        auto vfs_file = vfs->OpenFile(file_path, FileSys::OpenMode::Read);
-        if (!vfs_file) {
-            LOG_ERROR(Loader, "UPDATE MANAGER: FAILED at VFS Open. Could not open file: {}", file_path);
-            failed_files.append(QFileInfo(file).fileName() + tr(" (File Open Error)"));
-            continue;
-        }
-
+        auto vfs_file = vfs->OpenFile(file.toStdString(), FileSys::OpenMode::Read);
+        if (!vfs_file) continue;
         FileSys::NSP nsp(vfs_file);
-        if (nsp.GetStatus() != Loader::ResultStatus::Success) {
-            LOG_ERROR(Loader, "UPDATE MANAGER: FAILED at NSP Parse for file: {}", file_path);
-            failed_files.append(QFileInfo(file).fileName() + tr(" (NSP Parse Error)"));
-            continue;
-        }
-
-        const auto title_map = nsp.GetNCAs();
-        if (title_map.empty()) {
-            LOG_ERROR(Loader, "UPDATE MANAGER: FAILED, NSP contains no titles: {}", file_path);
-            failed_files.append(QFileInfo(file).fileName() + tr(" (Empty NSP)"));
-            continue;
-        }
-
-        const auto& [title_id, nca_map] = *title_map.begin();
-        const auto& [type_pair, meta_nca] = *std::find_if(nca_map.begin(), nca_map.end(), [](const auto& pair){
-            return pair.first.second == FileSys::ContentRecordType::Meta;
-        });
-
-        if (!meta_nca || meta_nca->GetSubdirectories().empty() || meta_nca->GetSubdirectories()[0]->GetFiles().empty()) {
-            LOG_ERROR(Loader, "UPDATE MANAGER: FAILED at Metadata search for title {}: malformed.", title_id);
-            failed_files.append(QFileInfo(file).fileName() + tr(" (Malformed Metadata)"));
-            continue;
-        }
-
-        const auto cnmt_file = meta_nca->GetSubdirectories()[0]->GetFiles()[0];
-        const FileSys::CNMT cnmt(cnmt_file);
-
-        std::string type_folder = "Updates";
-        u64 program_id = FileSys::GetBaseTitleID(title_id);
-        QString nsp_name = QFileInfo(sanitized_path).completeBaseName();
+        if (nsp.GetStatus() != Loader::ResultStatus::Success) continue;
+        const auto& title_map = nsp.GetNCAs();
+        if (title_map.empty()) continue;
+        u64 program_id = FileSys::GetBaseTitleID(title_map.begin()->first);
         std::string sdmc_path = Common::FS::GetCitronPathString(Common::FS::CitronPath::SDMCDir);
-        std::string dest_path_str = fmt::format("{}/autoloader/{:016X}/{}/{}", sdmc_path, program_id, type_folder, nsp_name.toStdString());
-
-        auto dest_dir = VfsFilesystemCreateDirectoryWrapper(vfs, dest_path_str, FileSys::OpenMode::ReadWrite);
-        if (!dest_dir) {
-            LOG_ERROR(Loader, "UPDATE MANAGER: FAILED to create destination directory: {}", dest_path_str);
-            failed_files.append(QFileInfo(file).fileName() + tr(" (Directory Creation Error)"));
-            continue;
-        }
-
-        bool copy_failed = false;
-        for (const auto& [key, nca] : nca_map) {
-            auto source_file = nca->GetBaseFile();
-            auto dest_file = dest_dir->CreateFileRelative(source_file->GetName());
-
-            if (!dest_file) {
-                LOG_ERROR(Loader, "UPDATE MANAGER: FAILED to create destination file for {}.", source_file->GetName());
-                copy_failed = true;
-                break;
-            }
-
-            if (!dest_file->Resize(source_file->GetSize())) {
-                LOG_ERROR(Loader, "UPDATE MANAGER: FAILED to resize destination file for {}.", source_file->GetName());
-                copy_failed = true;
-                break;
-            }
-
-            std::vector<u8> buffer(CopyBufferSize);
-            for (std::size_t i = 0; i < source_file->GetSize(); i += buffer.size()) {
-                if (progress.wasCanceled()) {
-                    dest_file->Resize(0);
-                    copy_failed = true;
-                    break;
-                }
-
-                const auto bytes_to_read = std::min(buffer.size(), source_file->GetSize() - i);
-                const auto bytes_read = source_file->Read(buffer.data(), bytes_to_read, i);
-
-                if (bytes_read == 0 && i < source_file->GetSize()) {
-                    LOG_ERROR(Loader, "UPDATE MANAGER: FAILED to read from source file {}.", source_file->GetName());
-                    copy_failed = true;
-                    break;
-                }
-
-                dest_file->Write(buffer.data(), bytes_read, i);
-
-                total_copied_bytes += bytes_read;
-                progress.setValue((total_copied_bytes * 100) / total_size_bytes);
-                QCoreApplication::processEvents();
-            }
-
-            if (copy_failed) {
-                break;
-            }
-        }
-
-        if (progress.wasCanceled()) {
-            failed_files.append(QFileInfo(file).fileName() + tr(" (Cancelled)"));
-            vfs->DeleteDirectory(dest_path_str);
-            break;
-        }
-
-        if (copy_failed) {
-            failed_files.append(QFileInfo(file).fileName());
-            vfs->DeleteDirectory(dest_path_str);
-        } else {
-            success_count++;
-        }
+        std::string dest_path = fmt::format("{}/autoloader/{:016X}/Updates/{}", sdmc_path, program_id, QFileInfo(file).fileName().toStdString());
+        VfsFilesystemCreateDirectoryWrapper(vfs, dest_path, FileSys::OpenMode::ReadWrite);
     }
-
-    progress.close();
-
-    QString message = tr("Update Manager install finished.");
-    if (success_count > 0) {
-        message += tr("\n%n file(s) successfully installed.", "", success_count);
-    }
-    if (!failed_files.isEmpty()) {
-        message += tr("\n%n file(s) failed to install:", "", failed_files.size());
-        message += QStringLiteral("\n- ") + failed_files.join(QStringLiteral("\n- "));
-    }
-    QMessageBox::information(this, tr("Install Complete"), message);
-
     RegisterAutoloaderContents();
-    game_list->PopulateAsync(UISettings::values.game_dirs);
 }
 
 void GMainWindow::OnToggleGridView() {
@@ -6726,9 +6443,6 @@ void GMainWindow::OnToggleGridView() {
 }
 
 void GMainWindow::OnRunAutoloaderFromGameList() {
-    // This creates a temporary instance of the filesystem logic,
-    // calls the autoloader function, and then the instance is automatically cleaned up.
-    // We pass 'this' (the GMainWindow) as the parent.
     ConfigureFilesystem fs_logic(this);
     fs_logic.OnRunAutoloader(true);
 }
