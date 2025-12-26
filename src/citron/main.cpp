@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <string>
 #include <thread>
 #include "core/hle/service/am/applet_manager.h"
 #include "core/loader/nca.h"
@@ -6186,14 +6187,23 @@ int main(int argc, char* argv[]) {
 
             QObject::connect(service, &Updater::UpdaterService::UpdateDownloadProgress, [](int percentage, qint64 received, qint64 total) {
                 double received_mb = static_cast<double>(received) / 1024.0 / 1024.0;
-                double total_mb = static_cast<double>(total) / 1024.0 / 1024.0;
 
                 fmt::print("\rDownloading: [");
-                int pos = percentage / 5;
-                for (int j = 0; j < 20; ++j) {
-                    if (j < pos) fmt::print("="); else if (j == pos) fmt::print(">"); else fmt::print(" ");
+                if (total > 0) {
+                    // We know the size, show a proper bar
+                    int pos = percentage / 5;
+                    for (int j = 0; j < 20; ++j) {
+                        if (j < pos) fmt::print("="); else if (j == pos) fmt::print(">"); else fmt::print(" ");
+                    }
+                    double total_mb = static_cast<double>(total) / 1024.0 / 1024.0;
+                    fmt::print("] {}% ({:.2f} MB / {:.2f} MB)", percentage, received_mb, total_mb);
+                } else {
+                    // Size is unknown, show a "spinner" or just bytes
+                    static int spinner = 0;
+                    const char* chars = "|/-\\";
+                    fmt::print(" {} ", chars[spinner++ % 4]);
+                    fmt::print("                   ] (Size unknown) {:.2f} MB received", received_mb);
                 }
-                fmt::print("] {}% ({:.2f} MB / {:.2f} MB)", percentage, received_mb, total_mb);
                 fflush(stdout);
             });
 
